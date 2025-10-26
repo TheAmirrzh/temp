@@ -256,6 +256,12 @@ class EnhancedLogNetModel(nn.Module):
         # 1. Encode proof state
         state_embedding = self.state_encoder(proof_state)  # [hidden_dim]
         
+        # Ensure on correct device
+        state_embedding = state_embedding.to(self.device if hasattr(self, 'device') else next(self.parameters()).device)
+        
+        # Expand for batch processing
+        x = state_embedding.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_d
+        
         # Expand for batch processing
         x = state_embedding.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
         

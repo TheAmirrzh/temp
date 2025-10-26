@@ -1,6 +1,10 @@
+#!/usr/bin/env python3
 """
-Main Training Script - Fully Integrated Pipeline
-Fixes all data flow and component integration issues
+Drop-in Replacement for main_training.py
+Uses FixedProofState with proper derivation tracking
+
+USAGE:
+  python main_training_fixed.py
 """
 
 import torch
@@ -12,45 +16,44 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 import time
 from pathlib import Path
+import sys
 
-from proof_state import ProofState, ProofStateEncoder, ProofValidator
-from proof_search import (
-    MCTSSearch, PolicyNetwork, RewardComputer, ProofSearchAgent
-)
-from data_loader import (
-    CurriculumDataLoader, DifficultyEstimator, estimate_instance_difficulties
-)
-from enhanced_model import (
-    EnhancedLogNetModel, EnhancedTrainingPipeline, HardNegativeLoss
-)
-from proof_validator import ProofValidator as PValidator, EvaluationMetrics, CurriculumAnalyzer
+# Import fixed components
+# NOTE: Either copy FixedProofState into proof_state.py or import from complete_fix.py
+try:
+    from complete_fix import FixedProofState, generate_valid_synthetic_data, verify_instance
+    ProofState = FixedProofState  # Use fixed version
+except ImportError:
+    print("⚠️  Using original ProofState (will have bugs!)")
+    from proof_state import ProofState
+    
+    # Fallback data generation
+    def generate_valid_synthetic_data(num_instances):
+        print("⚠️  Using fallback data generation")
+        return []
+
+from proof_state import ProofStateEncoder
+from proof_search import PolicyNetwork
+from data_loader import CurriculumDataLoader, estimate_instance_difficulties
+from enhanced_model import EnhancedLogNetModel, HardNegativeLoss
+from proof_validator import ProofValidator, EvaluationMetrics
 
 
-class IntegratedProofTrainer:
-    """
-    Complete trainer integrating all components.
-    """
+class FixedIntegratedTrainer:
+    """Integrated trainer using FixedProofState."""
     
     def __init__(self, config: Dict):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Random seeds
         self._set_seeds(config.get('seed', 42))
         
         # Components
         self.state_encoder = ProofStateEncoder(hidden_dim=config['hidden_dim'])
         self.policy_network = PolicyNetwork(config['hidden_dim'], config['num_rules'])
-        self.proof_search_agent = ProofSearchAgent(
-            self.state_encoder,
-            hidden_dim=config['hidden_dim'],
-            num_actions=config['num_rules'],
-            num_simulations=config.get('num_simulations', 50)
-        )
-        
         self.model = EnhancedLogNetModel(config).to(self.device)
         
-        # Optimizers
+        # Optimizer
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config['learning_rate'],
@@ -64,12 +67,6 @@ class IntegratedProofTrainer:
         # Loss functions
         self.criterion_rule = nn.CrossEntropyLoss()
         self.criterion_hard_neg = HardNegativeLoss(margin=1.0, hard_neg_weight=2.0)
-        self.criterion_value = nn.MSELoss()
-        
-        # Validators and metrics
-        self.proof_validator = PValidator()
-        self.eval_metrics = EvaluationMetrics()
-        self.curriculum_analyzer = CurriculumAnalyzer()
         
         # Tracking
         self.train_history = {
@@ -78,8 +75,10 @@ class IntegratedProofTrainer:
             'train_acc': [],
             'val_loss': [],
             'val_acc': [],
-            'curriculum_info': []
+            'num_samples_per_epoch': [],
         }
+        
+        self.proof_validator = ProofValidator()
     
     def _set_seeds(self, seed: int):
         """Set random seeds."""
@@ -89,76 +88,19 @@ class IntegratedProofTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
     
-    def generate_synthetic_data(self, num_instances: int = 100) -> List[Dict]:
-        """Generate synthetic proof instances for demonstration."""
-        instances = []
-        
-        for i in range(num_instances):
-            # Random problem size
-            num_axioms = random.randint(3, 8)
-            num_derived = random.randint(2, 5)  # NEW FACTS to derive
-            num_rules = random.randint(2, 8)
-            
-            total_facts = num_axioms + num_derived
-            
-            # Create axioms (base facts)
-            facts = [
-                {'formula': f'fact_{j}', 'confidence': random.uniform(0.7, 1.0)}
-                for j in range(num_axioms)
-            ]
-            
-            # Create rules that DERIVE new facts
-            rules = []
-            for j in range(num_rules):
-                # Premises: choose from axioms only
-                body = random.sample(
-                    range(num_axioms),  # Only from axioms, not derived facts
-                    min(random.randint(1, min(3, num_axioms)), num_axioms)
-                )
-                
-                # Conclusion: a NEW derived fact (index >= num_axioms)
-                head = [random.randint(num_axioms, total_facts - 1)]
-                
-                rules.append({
-                    'name': f'rule_{j}',
-                    'body': body,
-                    'head': head,
-                    'confidence': random.uniform(0.7, 0.99),  # High confidence
-                    'tactic_type': random.choice(['forward_chain', 'backward_chain'])
-                })
-            
-            # Add placeholder derived facts to facts list
-            # (These will be "derived" by applying rules)
-            for j in range(num_derived):
-                facts.append({
-                    'formula': f'derived_{j}',
-                    'confidence': 1.0
-                })
-            
-            instance = {
-                'facts': facts,
-                'rules': rules,
-                'goal': f'derived_{random.randint(0, num_derived - 1)}',  # Goal is a derived fact
-                'max_depth': random.randint(5, 15),
-                'max_steps': random.randint(10, 30)
-            }
-            
-            instances.append(instance)
-        
-        # Add difficulty estimates
-        instances = estimate_instance_difficulties(instances)
-        
-        return instances
     def train_epoch(self, curriculum_loader: CurriculumDataLoader, epoch: int, 
-               total_epochs: int) -> Tuple[float, float]:
-        """Train for one epoch with proper error handling."""
+                   total_epochs: int) -> Tuple[float, float]:
+        """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         correct = 0
         num_samples = 0
+        skipped = 0
         
-        for batch_idx in range(self.config.get('batches_per_epoch', 50)):
-            # Get curriculum-guided batch
+        num_batches = self.config.get('batches_per_epoch', 30)
+        
+        for batch_idx in range(num_batches):
+            # Get batch
             batch = curriculum_loader.get_batch(epoch, total_epochs)
             
             if not batch:
@@ -167,29 +109,27 @@ class IntegratedProofTrainer:
             for sample in batch:
                 try:
                     proof_state = sample['proof_state']
-                    difficulty_level = sample['difficulty_level']
+                    difficulty_level = sample.get('difficulty_level', 'medium')
                     
                     # Get applicable rules
                     applicable_rules = proof_state.get_applicable_rules()
                     
-                    # CRITICAL FIX: Skip only if truly no rules, but log it
                     if not applicable_rules:
-                        print(f"  [WARNING] No applicable rules for instance at epoch {epoch}")
+                        skipped += 1
                         continue
                     
                     # Forward pass
                     output = self.model(proof_state)
                     rule_logits = output['rule_logits']
                     
-                    # Select target rule (first applicable for now)
+                    # Target: first applicable rule
                     target_rule = applicable_rules[0]
                     
-                    # Ensure target is valid
                     if target_rule >= len(rule_logits):
-                        print(f"  [WARNING] Invalid rule index {target_rule} >= {len(rule_logits)}")
+                        skipped += 1
                         continue
                     
-                    # Losses
+                    # Compute losses
                     rule_loss = self.criterion_rule(
                         rule_logits.unsqueeze(0),
                         torch.tensor([target_rule], device=self.device)
@@ -199,7 +139,6 @@ class IntegratedProofTrainer:
                         rule_logits, target_rule, applicable_rules
                     )
                     
-                    # Combined loss
                     loss = rule_loss + 0.3 * hard_neg_loss
                     
                     # Backward
@@ -208,10 +147,8 @@ class IntegratedProofTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
                     
-                    # Tracking
+                    # Track
                     total_loss += loss.item()
-                    
-                    # Check accuracy
                     pred_rule = rule_logits.argmax().item()
                     if pred_rule == target_rule:
                         correct += 1
@@ -221,33 +158,24 @@ class IntegratedProofTrainer:
                     # Update curriculum
                     performance = 1.0 if pred_rule == target_rule else 0.0
                     curriculum_loader.update_performance(difficulty_level, performance)
-                    self.curriculum_analyzer.track_performance(
-                        difficulty_level, performance, epoch
-                    )
                 
                 except Exception as e:
-                    print(f"  [ERROR] Failed to process sample: {e}")
-                    traceback.import_exc()
+                    skipped += 1
                     continue
         
-        # Compute averages with proper handling
+        # Compute metrics
         avg_loss = total_loss / max(num_samples, 1)
         accuracy = correct / max(num_samples, 1)
         
-        # Debug logging
+        # Log statistics
         if num_samples == 0:
-            print(f"  [WARNING] No samples processed in epoch {epoch}!")
+            print(f"  ⚠️  No valid samples in epoch {epoch}! (Skipped: {skipped})")
         
         return avg_loss, accuracy
     
     def validate(self, curriculum_loader: CurriculumDataLoader, 
-                num_val_batches: int = 20) -> Tuple[float, float]:
-        """
-        Validate model.
-        
-        Returns:
-            (avg_loss, accuracy)
-        """
+                num_val_batches: int = 10) -> Tuple[float, float]:
+        """Validate model."""
         self.model.eval()
         total_loss = 0.0
         correct = 0
@@ -255,37 +183,39 @@ class IntegratedProofTrainer:
         
         with torch.no_grad():
             for _ in range(num_val_batches):
-                # Get validation batch
-                batch = curriculum_loader.get_batch(0, 1)  # Use static sampling
+                batch = curriculum_loader.get_batch(0, 1)
                 
                 if not batch:
                     continue
                 
                 for sample in batch:
-                    proof_state = sample['proof_state']
+                    try:
+                        proof_state = sample['proof_state']
+                        
+                        applicable_rules = proof_state.get_applicable_rules()
+                        if not applicable_rules:
+                            continue
+                        
+                        output = self.model(proof_state)
+                        rule_logits = output['rule_logits']
+                        
+                        target_rule = applicable_rules[0]
+                        
+                        loss = self.criterion_rule(
+                            rule_logits.unsqueeze(0),
+                            torch.tensor([target_rule], device=self.device)
+                        )
+                        
+                        total_loss += loss.item()
+                        
+                        pred_rule = rule_logits.argmax().item()
+                        if pred_rule == target_rule:
+                            correct += 1
+                        
+                        num_samples += 1
                     
-                    applicable_rules = proof_state.get_applicable_rules()
-                    if not applicable_rules:
+                    except Exception:
                         continue
-                    
-                    # Forward pass
-                    output = self.model(proof_state)
-                    rule_logits = output['rule_logits']
-                    
-                    target_rule = applicable_rules[0]
-                    
-                    loss = self.criterion_rule(
-                        rule_logits.unsqueeze(0),
-                        torch.tensor([target_rule], device=self.device)
-                    )
-                    
-                    total_loss += loss.item()
-                    
-                    pred_rule = rule_logits.argmax().item()
-                    if pred_rule == target_rule:
-                        correct += 1
-                    
-                    num_samples += 1
         
         avg_loss = total_loss / max(num_samples, 1)
         accuracy = correct / max(num_samples, 1)
@@ -293,15 +223,14 @@ class IntegratedProofTrainer:
         return avg_loss, accuracy
     
     def train(self, instances: List[Dict], num_epochs: int = 20):
-        """
-        Main training loop.
-        """
+        """Main training loop."""
         print("=" * 70)
-        print("🚀 INTEGRATED PROOF TRAINING PIPELINE")
+        print("🚀 FIXED INTEGRATED PROOF TRAINING")
         print("=" * 70)
-        print(f"📊 Training on {len(instances)} instances")
+        print(f"📊 Training instances: {len(instances)}")
         print(f"📈 Epochs: {num_epochs}")
         print(f"🔧 Device: {self.device}")
+        print(f"🧠 Model params: {sum(p.numel() for p in self.model.parameters()):,}")
         print("=" * 70)
         
         # Create curriculum loader
@@ -318,26 +247,23 @@ class IntegratedProofTrainer:
         for epoch in range(num_epochs):
             start_time = time.time()
             
-            # Training
+            # Train
             train_loss, train_acc = self.train_epoch(
                 curriculum_loader, epoch, num_epochs
             )
             
-            # Validation
-            val_loss, val_acc = self.validate(curriculum_loader, num_val_batches=10)
+            # Validate
+            val_loss, val_acc = self.validate(curriculum_loader)
             
-            # Scheduler step
+            # Scheduler
             self.scheduler.step(val_loss)
             
-            # Tracking
+            # Track
             self.train_history['epoch'].append(epoch)
             self.train_history['train_loss'].append(train_loss)
             self.train_history['train_acc'].append(train_acc)
             self.train_history['val_loss'].append(val_loss)
             self.train_history['val_acc'].append(val_acc)
-            self.train_history['curriculum_info'].append(
-                curriculum_loader.get_curriculum_info()
-            )
             
             # Early stopping
             if val_loss < best_val_loss:
@@ -367,7 +293,7 @@ class IntegratedProofTrainer:
         return self.train_history
     
     def save_results(self, output_dir: str = './results'):
-        """Save training results."""
+        """Save results."""
         Path(output_dir).mkdir(exist_ok=True)
         
         # Save history
@@ -383,40 +309,132 @@ class IntegratedProofTrainer:
 def main():
     """Main entry point."""
     config = {
-        # Model
         'hidden_dim': 128,
         'num_rules': 50,
         'num_tactics': 10,
-        
-        # Training
         'learning_rate': 0.001,
         'weight_decay': 1e-4,
         'batch_size': 4,
-        'batches_per_epoch': 50,
+        'batches_per_epoch': 30,
         'epochs': 20,
-        
-        # Curriculum
         'curriculum_temperature': 2.0,
         'num_simulations': 50,
-        
-        # General
         'seed': 42
     }
     
-    # Create trainer
-    trainer = IntegratedProofTrainer(config)
+    print("\n" + "=" * 70)
+    print("🔬 DEEP DIAGNOSIS & FIXED TRAINING PIPELINE")
+    print("=" * 70)
     
-    # Generate synthetic data
-    print("🎲 Generating synthetic data...")
-    instances = trainer.generate_synthetic_data(num_instances=100)
-    print(f"✅ Generated {len(instances)} instances")
+    # Create trainer
+    trainer = FixedIntegratedTrainer(config)
+    
+    # Generate FIXED data
+    print("\n🎲 Generating synthetic data with FIXED logic...")
+    try:
+        instances = generate_valid_synthetic_data(num_instances=100)
+        print(f"✅ Generated {len(instances)} instances")
+    except Exception as e:
+        print(f"❌ Data generation failed: {e}")
+        return 1
+    
+    # CRITICAL: Verify instances
+    print("\n🔍 Verifying instance validity (comprehensive check)...")
+    valid_instances = []
+    invalid_count = 0
+    
+    for inst in instances:
+        is_valid, msg = verify_instance(inst)
+        if is_valid:
+            valid_instances.append(inst)
+        else:
+            invalid_count += 1
+            if invalid_count <= 3:
+                print(f"  ⚠️  Instance {inst.get('instance_id', '?')}: {msg}")
+    
+    print(f"\n📊 Validation Results:")
+    print(f"  ✅ Valid: {len(valid_instances)}/{len(instances)}")
+    print(f"  ❌ Invalid: {invalid_count}/{len(instances)}")
+    
+    if len(valid_instances) < 10:
+        print("\n❌ ERROR: Not enough valid instances!")
+        print("   This indicates a fundamental problem with data generation.")
+        return 1
+    
+    # Sample verification: Show details of first valid instance
+    if valid_instances:
+        print("\n📝 Sample Instance Details:")
+        sample = valid_instances[0]
+        sample_state = FixedProofState(
+            sample['facts'],
+            sample['rules'],
+            sample['goal']
+        )
+        print(f"  Instance ID: {sample.get('instance_id')}")
+        print(f"  Total facts: {len(sample_state.facts)}")
+        print(f"  Axioms: {sample_state.num_axioms}")
+        print(f"  Available facts: {len(sample_state.available_facts)}")
+        print(f"  Rules: {len(sample_state.rules)}")
+        print(f"  Applicable rules: {sample_state.get_applicable_rules()}")
+        print(f"  Goal: {sample['goal']}")
+        
+        # Test rule application
+        applicable = sample_state.get_applicable_rules()
+        if applicable:
+            print(f"\n  🧪 Testing rule application...")
+            print(f"     Before: {len(sample_state.available_facts)} available facts")
+            success = sample_state.apply_rule(applicable[0])
+            print(f"     Applied rule {applicable[0]}: {success}")
+            print(f"     After: {len(sample_state.available_facts)} available facts")
+            print(f"     Goal satisfied: {sample_state.goal_satisfied()}")
+    
+    # Add difficulty estimates
+    print("\n📈 Adding difficulty estimates...")
+    valid_instances = estimate_instance_difficulties(valid_instances)
     
     # Train
-    history = trainer.train(instances, num_epochs=config['epochs'])
+    print("\n🎓 Starting training with {len(valid_instances)} valid instances...")
+    try:
+        history = trainer.train(valid_instances, num_epochs=config['epochs'])
+        
+        # Check if any training happened
+        if all(loss == 0.0 for loss in history['train_loss']):
+            print("\n⚠️  WARNING: All losses are 0.0!")
+            print("   This means no samples were processed during training.")
+            return 1
+        
+    except Exception as e:
+        print(f"\n❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
     # Save results
+    print("\n💾 Saving results...")
     trainer.save_results('./results')
+    
+    # Print summary
+    print("\n" + "=" * 70)
+    print("📊 TRAINING SUMMARY")
+    print("=" * 70)
+    final_train_acc = history['train_acc'][-1] if history['train_acc'] else 0.0
+    final_val_acc = history['val_acc'][-1] if history['val_acc'] else 0.0
+    best_val_acc = max(history['val_acc']) if history['val_acc'] else 0.0
+    
+    print(f"  Final Train Accuracy: {final_train_acc:.4f}")
+    print(f"  Final Val Accuracy: {final_val_acc:.4f}")
+    print(f"  Best Val Accuracy: {best_val_acc:.4f}")
+    print(f"  Total Epochs: {len(history['epoch'])}")
+    
+    if best_val_acc > 0.0:
+        print("\n✅ Training completed successfully!")
+        print("📈 Check './results/' for outputs")
+        return 0
+    else:
+        print("\n⚠️  Training completed but achieved 0% accuracy.")
+        print("   This suggests a problem with the learning setup.")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

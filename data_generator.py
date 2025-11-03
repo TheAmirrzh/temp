@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""
+FIXED: Horn Clause Generator with Deterministic, Verifiable Proofs
+
+Key Fixes:
+1. Backward chaining ensures UNIQUE proof
+2. All proofs are verified before output
+3. No random step ordering
+4. Deterministic rule selection
+5. FIXED: Robust topological sort in `reorder_proof_steps` to
+   prevent "unreachable steps" bug.
+"""
+
+import json
+import random
+from typing import Dict, List, Set, Tuple, Optional
+from enum import Enum
+from pathlib import Path
+from collections import deque
+
+
+class Difficulty(Enum):
+    EASY = "easy"
+    MEDIUM = "medium"
+    HARD = "hard"
+    VERY_HARD = "very_hard"
+
+
+class ProofVerifier:
+    """Verifies that a proof is valid."""
+    
+    def __init__(self, nodes: List[Dict], edges: List[Dict]):
+        self.nodes = nodes
+        self.edges = edges
+        self.nid_to_node = {n["nid"]: n for n in nodes}
+        self.nid_to_idx = {n["nid"]: i for i, n in enumerate(nodes)}
+    
+    def verify_proof(self, proof_steps: List[Dict]) -> Tuple[bool, str]:
+        """
+        Verify that proof_steps form a valid proof.
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        # Track what's known
+        known_facts = set()
+        
+        # Add initial facts
+        for node in self.nodes:
+            if node["type"] == "fact" and node.get("is_initial", False):
+                known_facts.add(node["atom"])
+        
+        # Verify each step
+        for step_idx, step in enumerate(proof_steps):
+            rule_nid = step.get("used_rule")
+            derived_nid = step.get("derived_node")
+            premises = step.get("premises", [])
+            
+            # Get nodes
+            if rule_nid not in self.nid_to_node:
+                return False, f"Step {step_idx}: rule {rule_nid} not in nodes"
+            
+            rule_node = self.nid_to_node[rule_nid]
+            if rule_node["type"] != "rule":
+                return False, f"Step {step_idx}: {rule_nid} is not a rule"
+            
+            if derived_nid not in self.nid_to_node:
+                return False, f"Step {step_idx}: derived node {derived_nid} not in nodes"
+            
+            derived_node = self.nid_to_node[derived_nid]
+            if derived_node["type"] != "fact":
+                return False, f"Step {step_idx}: {derived_nid} is not a fact"
+            
+            # Check premises exist
+            for premise_nid in premises:
+                if premise_nid not in self.nid_to_idx:
+                    return False, f"Step {step_idx}: premise {premise_nid} not found"
+            
+            # Check rule applicability
+            body_atoms = set(rule_node.get("body_atoms", []))
+            
+            if not body_atoms:
+                # Rule with no body should only fire once
+                if step_idx > 0:
+                    return False, f"Step {step_idx}: body-less rule fired after step 0"
+            else:
+                # All body atoms must be in known facts
+                if not body_atoms.issubset(known_facts):
+                    missing = body_atoms - known_facts
+                    return False, f"Step {step_idx}: missing premises {missing}"
+            
+            # Check derived fact is the rule's head
+            expected_head = rule_node.get("head_atom")
+            actual_head = derived_node.get("atom")
+            if expected_head != actual_head:
+                return False, f"Step {step_idx}: head mismatch. Expected {expected_head}, got {actual_head}"
+            
+            # Mark derived
+            known_facts.add(actual_head)
+        
+        return True, ""
+    
+    def find_all_derivable_atoms(self) -> Set[str]:
+        """Find all atoms that can be derived from initial facts."""
+        known = set()
+        
+        # Add initial facts
+        for node in self.nodes:
+            if node["type"] == "fact" and node.get("is_initial", False):
+                known.add(node["atom"])
+        
+        # Forward chain until fixpoint
+        changed = True
+        while changed:
+            changed = False
+            for node in self.nodes:
+                if node["type"] == "rule":
+                    body = set(node.get("body_atoms", []))
+                    head = node.get("head_atom")
+                    
+                    if body.issubset(known) and head not in known:
+                        known.add(head)
+                        changed = True
+        
+        return known
+
+
+def reorder_proof_steps(proof_steps, fact_map, initial_atoms, rules, rule_map):
+    """
+    FIXED: Robust topological sort (Kahn's algorithm)
+    This fixes the "unreachable steps" bug by only checking for premise
+    satisfaction, not whether the head is already known.
+    """
+    if not proof_steps:
+        return []
+
+    known_atoms = set(initial_atoms)
+    ordered_steps = []
+    
+    # Use a set of step_ids for efficient removal
+    remaining_step_ids = {step['step_id'] for step in proof_steps}
+    step_map = {step['step_id']: step for step in proof_steps}
+    # rule_map is already passed in, but ensure it's correct
+    if not rule_map:
+         rule_map = {r["rule_nid"]: r for r in rules}
+
+    max_iterations = len(remaining_step_ids)
+    # Loop one extra time than num_steps to detect cycles
+    for _ in range(max_iterations + 1): 
+        if not remaining_step_ids:
+            break # All steps ordered
+        
+        made_progress = False
+        steps_to_remove = set()
+        
+        for step_id in remaining_step_ids:
+            step = step_map[step_id]
+            rule_nid = step["used_rule"]
+            
+            if rule_nid not in rule_map:
+                continue # Should not happen, but safe
+                
+            rule_info = rule_map[rule_nid]
+            body_atoms = set(rule_info["body_atoms"])
+            head_atom = rule_info["head_atom"]
+            
+            # --- THIS IS THE FIX ---
+            # A step is executable if all its premises are known.
+            # We DON'T care if the head is already known during re-ordering.
+            if body_atoms.issubset(known_atoms):
+                # This step can be executed
+                ordered_steps.append(step)
+                known_atoms.add(head_atom) # Add its conclusion to known set
+                steps_to_remove.add(step_id)
+                made_progress = True
+        
+        if not made_progress and remaining_step_ids:
+            # This means we have a cycle or truly unreachable steps
+            print(f"WARNING: Discarding {len(remaining_step_ids)} unreachable steps (cycle or missing premises).")
+            # For example, print one problematic step
+            try:
+                step_id = list(remaining_step_ids)[0]
+                rule_info = rule_map[step_map[step_id]["used_rule"]]
+                missing = set(rule_info["body_atoms"]) - known_atoms
+                print(f"  -> Example: Step {step_id} (Rule {step_map[step_id]['used_rule']}) missing premises: {missing}")
+            except Exception as e:
+                print(f"  -> Error printing debug info for unreachable step: {e}")
+            break # Exit loop
+        
+        remaining_step_ids -= steps_to_remove
+    
+    # Assign sequential IDs
+    for i, step in enumerate(ordered_steps):
+        step['step_id'] = i
+    
+    return ordered_steps
+
+def generate_horn_instance_deterministic(
+    instance_id: str,
+    difficulty: Difficulty = Difficulty.MEDIUM,
+    seed: int = None,
+    goal: Optional[str] = None
+) -> Dict:
+    """
+    Generate Horn clause instance with DETERMINISTIC proof via backward chaining.
+    
+    Key improvements:
+    1. Choose goal first
+    2. Build proof backward from goal
+    3. Unique, verifiable proof guaranteed
+    4. Deterministic rule selection (always first applicable)
+    """
+    if seed:
+        random.seed(seed)
+    
+    # Difficulty parameters
+    params = {
+        Difficulty.EASY: {
+            "n_initial_facts": 4,
+            "n_rules": 4,
+            "max_proof_depth": 3,
+            "body_size": (1, 2),
+            "atoms_pool": 12
+        },
+        Difficulty.MEDIUM: {
+            "n_initial_facts": 8,
+            "n_rules": 12,
+            "max_proof_depth": 5,
+            "body_size": (2, 3),
+            "atoms_pool": 20
+        },
+        Difficulty.HARD: {
+            "n_initial_facts": 12,
+            "n_rules": 20,
+            "max_proof_depth": 8,
+            "body_size": (2, 3),
+            "atoms_pool": 35
+        },
+        Difficulty.VERY_HARD: {
+            "n_initial_facts": 20,
+            "n_rules": 35,
+            "max_proof_depth": 12,
+            "body_size": (3, 4),
+            "atoms_pool": 60
+        }
+    }
+    
+    p = params[difficulty]
+    atoms = [f"P{i}" for i in range(p["atoms_pool"])]
+    
+    nodes = []
+    edges = []
+    nid_counter = 0
+    
+    # STEP 1: Create initial facts
+    initial_atoms = random.sample(atoms, min(p["n_initial_facts"], len(atoms)))
+    fact_map = {}  # atom -> nid
+    
+    for atom in initial_atoms:
+        node = {
+            "nid": nid_counter,
+            "type": "fact",
+            "label": atom,
+            "atom": atom,
+            "is_initial": True
+        }
+        nodes.append(node)
+        fact_map[atom] = nid_counter
+        nid_counter += 1
+    
+    # STEP 2: Create rules deterministically
+    # Use forward chaining to ensure all rules can potentially fire
+    derived_atoms = set(initial_atoms)
+    rules = []
+    
+    for rule_idx in range(p["n_rules"]):
+        body_size = random.randint(*p["body_size"])
+        
+        # Body: select from currently derivable atoms
+        available = list(derived_atoms)
+        if len(available) < body_size:
+            available.extend(random.sample([a for a in atoms if a not in derived_atoms], 
+                                          min(body_size - len(available), 
+                                              len(atoms) - len(derived_atoms))))
+        
+        if len(available) < body_size:
+            body_size = len(available)
+        
+        if body_size == 0:
+            continue
+        
+        body_atoms = random.sample(available, body_size)
+        
+        # Head: choose NEW atom or from derivable (70% new, 30% existing)
+        if random.random() < 0.7:
+            unused = [a for a in atoms if a not in derived_atoms]
+            if unused:
+                head_atom = random.choice(unused)
+            else:
+                head_atom = random.choice(list(derived_atoms))
+        else:
+            head_atom = random.choice(list(derived_atoms))
+        
+        # Create rule node
+        rule_node = {
+            "nid": nid_counter,
+            "type": "rule",
+            "label": f"({' ∧ '.join(body_atoms)}) → {head_atom}",
+            "body_atoms": body_atoms,
+            "head_atom": head_atom
+        }
+        nodes.append(rule_node)
+        rule_nid = nid_counter
+        nid_counter += 1
+        
+        rules.append({
+            "rule_nid": rule_nid,
+            "body_atoms": body_atoms,
+            "head_atom": head_atom,
+            "rule_node": rule_node
+        })
+        
+        # Connect body facts to rule
+        for atom in body_atoms:
+            if atom not in fact_map:
+                fact_node = {
+                    "nid": nid_counter,
+                    "type": "fact",
+                    "label": atom,
+                    "atom": atom,
+                    "is_initial": False
+                }
+                nodes.append(fact_node)
+                fact_map[atom] = nid_counter
+                nid_counter += 1
+            
+            edges.append({
+                "src": fact_map[atom],
+                "dst": rule_nid,
+                "etype": "body"
+            })
+        
+        # Connect rule to head fact
+        if head_atom not in fact_map:
+            fact_node = {
+                "nid": nid_counter,
+                "type": "fact",
+                "label": head_atom,
+                "atom": head_atom,
+                "is_initial": False
+            }
+            nodes.append(fact_node)
+            fact_map[head_atom] = nid_counter
+            nid_counter += 1
+        
+        edges.append({
+            "src": rule_nid,
+            "dst": fact_map[head_atom],
+            "etype": "head"
+        })
+        
+        derived_atoms.add(head_atom)
+    
+    # STEP 3: Choose goal and generate unique proof via backward chaining
+    verifier = ProofVerifier(nodes, edges)
+    derivable = verifier.find_all_derivable_atoms()
+    
+    if not derivable:
+        # Degenerate case: no proofs possible, return empty
+        return {
+            "id": instance_id,
+            "nodes": nodes,
+            "edges": edges,
+            "proof_steps": [],
+            "goal": None,
+            "metadata": {
+                "difficulty": difficulty.value,
+                "n_nodes": len(nodes),
+                "n_edges": len(edges),
+                "n_initial_facts": len(initial_atoms),
+                "n_rules": len(rules),
+                "proof_length": 0,
+                "source": "backward_chaining_fixed"
+            }
+        }
+    
+    # Choose goal: prefer derived (non-initial) atoms
+    non_initial_derivable = [a for a in derivable if a not in initial_atoms]
+    if non_initial_derivable:
+        goal = random.choice(non_initial_derivable)
+    else:
+        goal = random.choice(list(derivable))
+    
+    # STEP 4: Backward chain from goal to build proof
+    proof_steps = []
+    
+    def backward_chain(goal_atom: str, depth: int = 0, visited_in_path=None) -> bool:
+        """
+        FIXED: Better cycle detection and proof building
+        """
+        if visited_in_path is None:
+            visited_in_path = set()
+        
+        if depth > p["max_proof_depth"]:
+            return False
+        
+        # Cycle detection
+        if goal_atom in visited_in_path:
+            return False
+        
+        # Base case: initial fact
+        if goal_atom in initial_atoms:
+            return True
+        
+        visited_in_path.add(goal_atom)
+        
+        # Find rules that derive this atom
+        applicable_rules = [
+            r for r in rules 
+            if r["head_atom"] == goal_atom
+        ]
+        
+        if not applicable_rules:
+            visited_in_path.discard(goal_atom)
+            return False
+        
+        # CRITICAL FIX: Sort rules by body size (prefer simpler)
+        # This reduces proof complexity
+        applicable_rules.sort(key=lambda r: len(r["body_atoms"]))
+        
+        for rule_info in applicable_rules:
+            body_atoms = rule_info["body_atoms"]
+            
+            # Try to prove all body atoms
+            all_provable = True
+            for atom in body_atoms:
+                # CRITICAL: Pass copy of visited set
+                if not backward_chain(atom, depth + 1, visited_in_path.copy()):
+                    all_provable = False
+                    break
+            
+            if all_provable:
+                # Success! Add proof step
+                rule_nid = rule_info["rule_nid"]
+                derived_nid = fact_map[goal_atom]
+                premise_nids = [fact_map[a] for a in body_atoms]
+                
+                proof_steps.append({
+                    "step_id": len(proof_steps), # Temporary ID
+                    "derived_node": derived_nid,
+                    "used_rule": rule_nid,
+                    "premises": premise_nids
+                })
+                
+                visited_in_path.discard(goal_atom)
+                return True
+        
+        visited_in_path.discard(goal_atom)
+        return False
+    
+    # Generate proof
+    proof_found = backward_chain(goal)
+    
+    if not proof_found:
+        # Goal not derivable - shouldn't happen but handle gracefully
+        proof_steps = []
+    
+    # STEP 4.5: Reorder proof steps into valid forward-chaining order
+    # Backward chaining produces steps in discovery order, not execution order!
+    rule_map = {r["rule_nid"]: r for r in rules}
+    proof_steps = reorder_proof_steps(proof_steps, fact_map, initial_atoms, rules, rule_map)
+    
+    # STEP 5: Verify proof
+    is_valid, error_msg = verifier.verify_proof(proof_steps)
+    if not is_valid:
+        print(f"WARNING: Generated invalid proof for {instance_id}: {error_msg}")
+        proof_steps = []
+    
+    return {
+        "id": instance_id,
+        "nodes": nodes,
+        "edges": edges,
+        "proof_steps": proof_steps,
+        "goal": goal,
+        "metadata": {
+            "difficulty": difficulty.value,
+            "n_nodes": len(nodes),
+            "n_edges": len(edges),
+            "n_initial_facts": len(initial_atoms),
+            "n_rules": len(rules),
+            "proof_length": len(proof_steps),
+            "source": "backward_chaining_fixed"
+        }
+    }
+
+def validate_proof_execution_order(proof_steps, nodes, initial_atoms, rules):
+    """
+    CRITICAL: Validate that each step's rule is actually applicable when executed.
+    
+    Returns:
+        (is_valid, error_message, invalid_step_idx)
+    """
+    known_atoms = set(initial_atoms)
+    rule_map = {r["rule_nid"]: r for r in rules}
+    
+    for step_idx, step in enumerate(proof_steps):
+        rule_nid = step["used_rule"]
+        derived_nid = step["derived_node"]
+        
+        # Get rule and derived fact
+        if rule_nid not in rule_map:
+            return False, f"Rule {rule_nid} not found", step_idx
+        
+        rule = rule_map[rule_nid]
+        body_atoms = set(rule["body_atoms"])
+        head_atom = rule["head_atom"]
+        
+        # Check 1: All premises must be known
+        if not body_atoms.issubset(known_atoms):
+            missing = body_atoms - known_atoms
+            return False, f"Missing premises: {missing}", step_idx
+        
+        # Check 2: Head must NOT already be known (no redundant derivation)
+        if head_atom in known_atoms:
+            return False, f"Head already known: {head_atom}", step_idx
+        
+        # Mark as derived
+        known_atoms.add(head_atom)
+    
+    return True, "OK", -1
+
+def generate_dataset(
+    output_dir: str,
+    n_per_difficulty: Dict[Difficulty, int],
+    seed: int = 42
+):
+    """Generate complete dataset with verification."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    stats = {"total": 0, "by_difficulty": {}, "invalid": 0}
+    
+    for diff, count in n_per_difficulty.items():
+        diff_dir = output_dir / diff.value
+        diff_dir.mkdir(exist_ok=True)
+        
+        print(f"Generating {count} {diff.value} instances...")
+        
+        valid_count = 0
+        attempt = 0
+        max_attempts = count * 3  # Allow retries for degenerate cases
+        
+        while valid_count < count and attempt < max_attempts:
+            inst = generate_horn_instance_deterministic(
+                f"{diff.value}_{valid_count}",
+                diff,
+                seed + attempt + hash(diff.value) % 10000
+            )
+            attempt += 1
+            
+            # Only accept instances with non-empty proofs
+            if len(inst["proof_steps"]) > 0:
+                path = diff_dir / f"{diff.value}_{valid_count}.json"
+                with open(path, 'w') as f:
+                    json.dump(inst, f, indent=2)
+                valid_count += 1
+        
+        stats

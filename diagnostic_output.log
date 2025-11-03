@@ -1,0 +1,36 @@
+/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv311/lib/python3.11/site-packages/torch/torch_version.py:28: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import packaging  # type: ignore[attr-defined, no-redef]
+INFO:__main__:
+================================================================================
+INFO:__main__:PROFESSIONAL PIPELINE DIAGNOSTIC
+INFO:__main__:================================================================================
+INFO:__main__:
+STAGE 1: Validating generated data files...
+INFO:__main__:Found 1400 JSON files
+INFO:__main__:✅ All checked files have valid proofs
+INFO:__main__:
+STAGE 2: Loading datasets...
+INFO:__main__:✅ Datasets loaded
+INFO:__main__:
+STAGE 3: Instrumenting first batch...
+INFO:__main__:
+✅ All accessed samples have applicable targets
+INFO:__main__:
+================================================================================
+INFO:__main__:DIAGNOSTIC COMPLETE - ALL CHECKS PASSED
+INFO:__main__:================================================================================
+✅ easy: 280 train, 60 val, 60 test
+✅ hard: 210 train, 45 val, 45 test
+✅ medium: 280 train, 60 val, 60 test
+✅ very_hard: 210 train, 45 val, 45 test
+Loading 980 files...
+✅ Loaded 2206 proof steps from 980 instances
+Loading 210 files...
+✅ Loaded 474 proof steps from 210 instances
+Loading 210 files...
+✅ Loaded 484 proof steps from 210 instances
+
+✅ No data leakage detected
+   Train instances: 980, steps: 2206
+   Val instances: 210, steps: 474
+   Test instances: 210, steps: 484

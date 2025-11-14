@@ -17,6 +17,7 @@ Key improvements:
 - Expected +27% improvement in Hit@1
 """
 
+from torch.optim.lr_scheduler import OneCycleLR
 from curriculum import SetToSetCurriculumScheduler
 
 import torch
@@ -38,8 +39,9 @@ from typing import Dict, Tuple, Optional
 # Import fixed modules
 from dataset import ProofStepDataset, create_properly_split_dataloaders
 from metrics import ProofMetricsCompute
-from model import CriticallyFixedProofGNN
-from losses import ContrastiveRankingLoss, FocalApplicabilityLoss
+from model import CriticallyFixedProofGNN, SOTAFixedProofGNN
+from losses import ApplicabilityConstrainedLoss, ContrastiveRankingLoss, DecoupledApplicabilityRankingLoss, FocalApplicabilityLoss, HybridTripletListwiseValueLoss, InfoNCEListwiseLoss, TheoreticallySoundLoss, TripletLossWithHardMining
+from losses import FocusedRankingLoss
 from temporal_encoder import CausalProofTemporalEncoder
 
 
@@ -142,7 +144,7 @@ def train_epoch(model: nn.Module, train_loader: DataLoader,
         batch = batch.to(device)
         
         # Forward pass
-        scores, embeddings, value = model(batch)
+        scores, embeddings, value, recon_spectral = model(batch)
         
         # Get batch size (number of graphs)
         batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
@@ -290,13 +292,15 @@ def evaluate(model, val_loader, criterion, device, split_name='val'):
     mrr_sum = 0.0
     ndcg_sum = 0.0
     app_acc_sum = 0.0
-    
+    total_target_prob = 0.0
+    total_rank_percentile = 0.0
+
     for batch in tqdm(val_loader, desc=f"Eval {split_name}"):
         if batch is None: continue
         batch = batch.to(device)
         
         # Forward pass
-        scores, embeddings, value = model(batch)
+        scores, embeddings, value, recon_spectral = model(batch)
         
         batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
         
@@ -315,7 +319,14 @@ def evaluate(model, val_loader, criterion, device, split_name='val'):
                 continue
 
             target_idx_global = batch.y[i].item()
-            node_offset = batch.node_offsets[i].item()
+
+            if hasattr(batch, 'node_offsets') and isinstance(batch.node_offsets, torch.Tensor) and i < len(batch.node_offsets):
+                node_offset = batch.node_offsets[i].item()
+            else:
+                # Fallback: compute offset manually from the mask
+                node_offset = mask.nonzero()[0].item() if mask.any() else 0
+            # --- END FIX ---
+
             target_idx_local = target_idx_global - node_offset
 
             if target_idx_local < 0 or target_idx_local >= len(graph_scores):
@@ -356,6 +367,12 @@ def evaluate(model, val_loader, criterion, device, split_name='val'):
                 rank_val = rank[0].item() + 1
                 ndcg_sum += 1.0 / np.log2(rank_val + 1)
             
+            target_prob, rank_pct = compute_ranking_quality(
+                graph_scores, target_idx_local, graph_applicable
+            )
+            total_target_prob += target_prob
+            total_rank_percentile += rank_pct
+
             num_samples += 1
         
     # Average metrics
@@ -370,12 +387,15 @@ def evaluate(model, val_loader, criterion, device, split_name='val'):
         f'{split_name}_mrr': mrr_sum / n,
         f'{split_name}_ndcg': ndcg_sum / n,
         f'{split_name}_applicable_acc': app_acc_sum / n,
+        f'{split_name}_target_prob': total_target_prob / n,
+        f'{split_name}_rank_percentile': total_rank_percentile / n,
         f'{split_name}_num_samples': num_samples
     }
 
 def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
-                                device, epoch, scheduler, # 'scheduler' is the curriculum
-                                grad_accum_steps=1, value_loss_weight=0.1):
+                                device, epoch, scheduler,
+                                scheduler_onecycle, # 'scheduler' is the curriculum
+                                grad_accum_steps=4, value_loss_weight=0.1):
     """
     FIXED: Merges correct per-graph slicing with curriculum loss weighting.
     """
@@ -402,7 +422,7 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
         batch = batch.to(device)
         
         # --- FORWARD PASS ---
-        scores, embeddings, value = model(batch)
+        scores, embeddings, value, recon_spectral = model(batch)
         
         # Get batch size (number of graphs)
         batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
@@ -416,8 +436,6 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
         graphs_processed_in_batch = 0
         
         for i in range(batch_size):
-            # --- START: Correct Per-Graph Slicing ---
-            # Get nodes for this graph
             mask = (batch.batch == i)
             graph_scores = scores[mask]
             graph_embeddings = embeddings[mask]
@@ -425,10 +443,15 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
             if len(graph_scores) == 0:
                 continue
             
-            # Get target (local index)
+            # FIX: Safer node offset access
+            if hasattr(batch, 'node_offsets') and isinstance(batch.node_offsets, torch.Tensor):
+                node_offset = batch.node_offsets[i].item()
+            else:
+                # Fallback: compute offset manually
+                node_offset = mask.nonzero()[0].item() if mask.any() else 0
+            
             target_idx_global = batch.y[i].item()
-            node_offset = batch.node_offsets[i].item()
-            target_idx_local = target_idx_global - node_offset # <-- Correct local index
+            target_idx_local = target_idx_global - node_offset
 
             # Validate local index
             if target_idx_local < 0 or target_idx_local >= len(graph_scores):
@@ -489,10 +512,10 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
             
             # --- BACKWARD PASS (per-graph) ---
             # We accumulate gradients, so we call backward on the normalized loss
-            final_loss.backward()
+            
             
             # --- METRIC ACCUMULATION (unweighted) ---
-            batch_loss += combined_loss.item()
+            batch_loss = batch_loss + combined_loss
             batch_rank_loss += rank_loss.item()
             batch_value_loss += value_loss.item()
             
@@ -506,11 +529,7 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
         
         # --- END OF BATCH ---
         
-        # --- GRADIENT STEP (after accumulation) ---
-        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1 == len(train_loader)):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+
         
         # --- EPOCH-LEVEL METRIC UPDATE ---
         if graphs_processed_in_batch > 0:
@@ -523,7 +542,17 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
             
             num_samples += graphs_processed_in_batch # Total number of graphs
             num_batches_processed += 1
-        
+
+            avg_batch_loss = batch_loss / graphs_processed_in_batch
+            normalized_loss = avg_batch_loss / grad_accum_steps
+            normalized_loss.backward() 
+                # --- GRADIENT STEP (after accumulation) ---
+        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1 == len(train_loader)):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            if scheduler_onecycle is not None:
+                scheduler_onecycle.step()
         # Update progress bar
         if num_samples > 0:
             progress_bar.set_postfix({
@@ -547,6 +576,30 @@ def train_epoch_with_curriculum(model, train_loader, optimizer, criterion,
         'num_samples': num_samples
     }
 
+
+def compute_ranking_quality(scores: torch.Tensor, target_idx: int,
+                            applicable_mask: torch.Tensor) -> Tuple[float, float]:
+    """Measure how well the model ranks the target among applicable rules"""
+    applicable_indices = applicable_mask.nonzero(as_tuple=True)[0]
+    
+    if applicable_indices.numel() == 0 or target_idx not in applicable_indices:
+        return 0.0, 1.0 # 0% prob, 100% (worst) rank percentile
+
+    applicable_scores = scores[applicable_indices]
+    
+    # Normalize scores to probabilities
+    probs = F.softmax(applicable_scores, dim=0)
+    
+    target_pos_mask = (applicable_indices == target_idx)
+    if not target_pos_mask.any():
+         return 0.0, 1.0
+         
+    target_pos = target_pos_mask.nonzero(as_tuple=True)[0].item()
+    
+    # Return: (1) probability mass on target, (2) ranking percentile
+    rank_percentile = target_pos / len(applicable_indices)
+    return probs[target_pos].item(), rank_percentile
+
 # ==============================================================================
 # MAIN TRAINING LOOP
 # ==============================================================================
@@ -555,13 +608,16 @@ def main():
         description="Train with Critical Fixes Applied"
     )
     
-    parser.add_argument('--data-dir', type=str, required=True,
+    parser.add_argument('--data-dir', type=str, default='generated_data',
                        help='Directory with generated proof data')
-    parser.add_argument('--spectral-dir', type=str, default=None,
+    parser.add_argument('--spectral-dir', type=str, default='spectral_cache',
                        help='Directory with precomputed spectral features')
     parser.add_argument('--exp-dir', type=str, default='experiments/critical_fixes',
                        help='Directory to save experiment results')
-    
+    # parser.add_argument('--atom-embed-file', type=str, required=True, # <-- NEW
+    #                    help='Path to the precomputed atom_embeddings.json file')
+
+
     # Model hyperparameters
     parser.add_argument('--hidden-dim', type=int, default=256,
                        help='Hidden dimension for all pathways')
@@ -573,11 +629,11 @@ def main():
                        help='Spectral dimension')
     
     # Loss hyperparameters
-    parser.add_argument('--margin', type=float, default=1.0,
+    parser.add_argument('--margin', type=float, default=2.0,
                        help='Margin for focal loss')
-    parser.add_argument('--gamma', type=float, default=2.0,
+    parser.add_argument('--gamma', type=float, default=1.5,
                        help='Focusing parameter for focal loss')
-    parser.add_argument('--alpha', type=float, default=0.25,
+    parser.add_argument('--alpha', type=float, default=0.5,
                        help='Hard negative weight')
     
     # Training hyperparameters
@@ -587,7 +643,7 @@ def main():
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate')
-    parser.add_argument('--grad-accum-steps', type=int, default=2,
+    parser.add_argument('--grad-accum-steps', type=int, default=4,
                        help='Gradient accumulation steps')
     parser.add_argument('--value-loss-weight', type=float, default=0.1,
                        help='Weight for value prediction loss')
@@ -632,6 +688,18 @@ def main():
     logger.info(f"  ✅ Focal Applicability Loss (hard negative mining)")
     logger.info("="*80 + "\n")
     
+    # logger.info(f"Loading atom embeddings from {args.atom_embed_file}...")
+    # try:
+    #     with open(args.atom_embed_file, 'r') as f:
+    #         atom_embeddings = json.load(f)
+    #     # Get dimension from the first embedding
+    #     atom_embed_dim = len(next(iter(atom_embeddings.values())))
+    #     logger.info(f"✅ Atom embedding dimension: {atom_embed_dim}")
+    # except Exception as e:
+    #     logger.error(f"FATAL: Could not load atom embeddings. {e}")
+    #     return
+    in_dim = 29
+    logger.info(f"Calculated final model input dimension: {in_dim}")
     # Load data with proper split
     logger.info("Loading data with proper instance-level split...")
     train_loader, val_loader, test_loader = create_properly_split_dataloaders(
@@ -641,6 +709,7 @@ def main():
         val_ratio=0.15,
         batch_size=args.batch_size,
         seed=args.seed,
+        # atom_embedding_file=args.atom_embed_file, # <-- PASS IT
         
     )
     
@@ -654,11 +723,13 @@ def main():
         total_epochs=args.epochs,
         dataset_metadata=train_dataset.instance_metadata if hasattr(train_dataset, 'instance_metadata') else {}
     )
+
+    
     logger.info("✅ Curriculum scheduler initialized\n")
     # Initialize model
     logger.info("Initializing CriticallyFixedProofGNN...")
-    model = CriticallyFixedProofGNN(
-        in_dim=22,
+    model = SOTAFixedProofGNN(
+        in_dim=in_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -668,31 +739,25 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"✅ Model initialized: {num_params:,} parameters\n")
     
-    # Initialize loss and optimizer
-    logger.info("Initializing Focal Applicability Loss...")
-    criterion = ContrastiveRankingLoss(
-        temperature=0.1,
-        margin=args.margin,
-        alpha_rank=0.6,
-        alpha_contrastive=0.3,
-        alpha_hard=0.1
-    )
-    logger.info(f"✅ Loss initialized (margin={args.margin}, gamma={args.gamma})\n")
+    logger.info("Initializing ApplicabilityConstrainedLoss...")
+    criterion = ApplicabilityConstrainedLoss().to(device)
+    logger.info(f"✅ Loss initialized (margin={args.margin})\n")
+
+    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
     
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-3,
-        betas=(0.9, 0.98)
-    )
-    
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    # Calculate steps_per_epoch, ensuring it's at least 1
+    steps_per_epoch = max(len(train_loader), 1)
+
+    scheduler = OneCycleLR(
         optimizer,
-        mode='max',
-        factor=0.5,
-        patience=5,
-        min_lr=1e-6
+        max_lr=2e-4, # Use a higher max LR as recommended
+        epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.15,
+        div_factor=25.0,
+        final_div_factor=1000.0 
     )
+    logger.info("Using OneCycleLR scheduler with 10% warmup.")
     
     # Training loop
     best_val_hit1 = 0.0
@@ -711,7 +776,7 @@ def main():
         # Train
         train_metrics = train_epoch_with_curriculum(
             model, train_loader, optimizer, criterion, device, epoch, 
-            curriculum_scheduler, args.grad_accum_steps, 
+            curriculum_scheduler, scheduler, args.grad_accum_steps, 
             args.value_loss_weight
         )
         
@@ -759,7 +824,7 @@ def main():
             break
         
         # LR scheduling
-        scheduler.step(val_metrics['val_hit@1'])
+        # scheduler.step(val_metrics['val_hit@1'])
 
         train_dataset.report()
 
@@ -804,5 +869,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

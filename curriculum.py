@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 from typing import Dict, List, Optional
@@ -47,9 +46,9 @@ class SetToSetCurriculumScheduler:
         Returns difficulty sets, depth limits, and sampling weights.
         """
         self.current_epoch = epoch
-        progress = epoch / self.total_epochs
+        progress = (epoch / self.total_epochs) ** 1.5
         
-        if progress < 0.25:
+        if progress < 0.4:  # Extended foundation phase
             return {
                 'phase': 'Foundation',
                 'description': 'Learn on easy proofs (depth ≤ 3)',
@@ -60,32 +59,25 @@ class SetToSetCurriculumScheduler:
                 'confidence_threshold': 0.5,
             }
         
-        elif progress < 0.50:
+        elif progress < 0.7:  # Gradual increase
+            max_len = int(3 + 3 * (progress - 0.4) / 0.3)  # 3 -> 6
             return {
                 'phase': 'Consolidation',
-                'description': 'Mix easy (40%) + medium (60%)',
+                'description': f'Mix easy + medium (depth ≤ {max_len})',
                 'include_difficulties': ['easy', 'medium'],
                 'sampling_weights': {'easy': 0.4, 'medium': 0.6},
-                'max_proof_length': 5,
-                'max_step_depth': 5,
+                'max_proof_length': max_len,
+                'max_step_depth': max_len,
                 'confidence_threshold': 0.6,
             }
         
-        elif progress < 0.75:
-            return {
-                'phase': 'Challenge',
-                'description': 'Medium (50%) + hard (50%)',
-                'include_difficulties': ['medium', 'hard'],
-                'sampling_weights': {'medium': 0.5, 'hard': 0.5},
-                'max_proof_length': 8,
-                'max_step_depth': 8,
-                'confidence_threshold': 0.7,
-            }
-        
-        else:
+        else:  # Mastery (ramps from 6 -> 12)
+            max_len = int(6 + 6 * (progress - 0.7) / 0.3)  # 6 -> 12
+            # At final epoch (progress=1.0), max_len = 12
+            # We still need to include hard/very_hard
             return {
                 'phase': 'Mastery',
-                'description': 'All difficulties (balanced)',
+                'description': f'All difficulties (depth ≤ {max_len})',
                 'include_difficulties': ['easy', 'medium', 'hard', 'very_hard'],
                 'sampling_weights': {
                     'easy': 0.1, 
@@ -93,8 +85,8 @@ class SetToSetCurriculumScheduler:
                     'hard': 0.4, 
                     'very_hard': 0.15
                 },
-                'max_proof_length': 15,
-                'max_step_depth': 15,
+                'max_proof_length': max_len,
+                'max_step_depth': max_len,
                 'confidence_threshold': 0.8,
             }
     
@@ -156,3 +148,4 @@ class SetToSetCurriculumScheduler:
             f"(max_length={config['max_proof_length']}, "
             f"max_depth={config['max_step_depth']})"
         )
+        

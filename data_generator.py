@@ -423,7 +423,7 @@ def generate_horn_instance_deterministic(
         if not applicable_rules:
             visited_in_path.discard(goal_atom)
             return False
-        
+        random.shuffle(applicable_rules)
         # CRITICAL FIX: Sort rules by body size (prefer simpler)
         # This reduces proof complexity
         applicable_rules.sort(key=lambda r: len(r["body_atoms"]))
@@ -492,6 +492,7 @@ def generate_horn_instance_deterministic(
             "source": "backward_chaining_fixed"
         }
     }
+
 
 def validate_proof_execution_order(proof_steps, nodes, initial_atoms, rules):
     """
@@ -566,3 +567,84 @@ def generate_dataset(
                 valid_count += 1
         
         stats
+
+
+# --- ADD THIS ENTIRE BLOCK TO THE END of data_generator.py ---
+
+import argparse
+
+if __name__ == "__main__":
+    """
+    Main execution block to run the data generator from the command line.
+    """
+    
+    parser = argparse.ArgumentParser(
+        description="Generate Horn Clause instances with verifiable proofs."
+    )
+    
+    parser.add_argument(
+        '--output-dir', 
+        type=str, 
+        required=True,
+        help='Directory to save the generated JSON files.'
+    )
+    parser.add_argument(
+        '--easy', 
+        type=int, 
+        default=0,
+        help='Number of EASY instances to generate.'
+    )
+    parser.add_argument(
+        '--medium', 
+        type=int, 
+        default=0,
+        help='Number of MEDIUM instances to generate.'
+    )
+    parser.add_argument(
+        '--hard', 
+        type=int, 
+        default=0,
+        help='Number of HARD instances to generate.'
+    )
+    parser.add_argument(
+        '--very-hard', 
+        type=int, 
+        default=0,
+        help='Number of VERY_HARD instances to generate.'
+    )
+    parser.add_argument(
+        '--seed', 
+        type=int, 
+        default=42,
+        help='Random seed for generation.'
+    )
+    
+    args = parser.parse_args()
+    
+    # Build the difficulty dictionary from arguments
+    n_per_difficulty = {
+        Difficulty.EASY: args.easy,
+        Difficulty.MEDIUM: args.medium,
+        Difficulty.HARD: args.hard,
+        Difficulty.VERY_HARD: args.very_hard
+    }
+    
+    # Filter out difficulties with 0 count
+    n_per_difficulty = {k: v for k, v in n_per_difficulty.items() if v > 0}
+    
+    if not n_per_difficulty:
+        print("No instances to generate (all counts are 0). Exiting.")
+        exit(0)
+    
+    print(f"Starting data generation (seed={args.seed})...")
+    
+    # Call the main generation function
+    generate_dataset(
+        output_dir=args.output_dir,
+        n_per_difficulty=n_per_difficulty,
+        seed=args.seed
+    )
+    
+    print("Data generation complete.")
+
+# --- END OF NEW BLOCK ---

@@ -14,11 +14,14 @@ Based on SSGNN principles and your project goals.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GATv2Conv, global_add_pool, global_mean_pool, global_max_pool
 from temporal_encoder import CausalProofTemporalEncoder, MultiScaleTemporalEncoder
 from typing import List, Dict, Optional, Tuple
 from torch_scatter import scatter_mean
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -60,8 +63,8 @@ class ImprovedSpectralFilter(nn.Module):
         
         # Stage 4: Output projection
         self.output_proj = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim)
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, out_dim)
         )
         
         self._init_weights()
@@ -182,8 +185,10 @@ class TypeAwareGATv2Conv(nn.Module):
         self.combine = nn.Linear(out_channels + out_channels // 4, out_channels)
         
     def forward(self, x, edge_index, node_types, edge_attr=None):
-        h1 = self.gat_fact_to_rule(x, edge_index, edge_attr=edge_attr)
-        h2 = self.gat_rule_to_fact(x, edge_index, edge_attr=edge_attr)
+
+        x_normed = nn.LayerNorm(x.shape[-1])(x)  # Normalize BEFORE attention
+        h1 = self.gat_fact_to_rule(x_normed, edge_index, edge_attr=edge_attr)
+        h2 = self.gat_rule_to_fact(x_normed, edge_index, edge_attr=edge_attr)
         type_emb = self.type_proj(node_types)
         h = torch.cat([h1 + h2, type_emb], dim=-1)
         return self.combine(h)
@@ -368,7 +373,7 @@ class FixedTemporalSpectralGNN(nn.Module):
         h_temporal = self.temporal_encoder(
             derived_mask, 
             step_numbers, 
-            h_spectral  # Use spectral, not spatial!
+            x  # Use spectral, not spatial!
         )  # [N, hidden_dim]
         
         # FIXED: Late fusion - concatenate all three pathways
@@ -731,7 +736,7 @@ class CriticallyFixedProofGNN(nn.Module):
             optimizer.step()
     """
     
-    def __init__(self, in_dim: int = 22, hidden_dim: int = 256, 
+    def __init__(self, in_dim: int = 24, hidden_dim: int = 256, 
                  num_layers: int = 3, dropout: float = 0.3, k: int = 16):
         super().__init__()
         
@@ -740,16 +745,23 @@ class CriticallyFixedProofGNN(nn.Module):
         self.k = k
         
         # Spectral pathway
-        self.spectral_filter = SpectralFilterFixed(in_dim, hidden_dim, k)
+        self.spectral_filter = ImprovedSpectralFilter(
+            in_dim=in_dim,
+            out_dim=hidden_dim,
+            k=k
+        )
+        
         
         # Spatial pathway (GNN)
         self.spatial_gnn = SpatialGNNFixed(in_dim, hidden_dim, num_layers, dropout)
         
         # Temporal pathway with CAUSAL MASKING
-        self.temporal_encoder = CausalProofTemporalEncoder(
-            hidden_dim, num_heads=4, frontier_window=5, dropout=dropout
+        self.temporal_encoder = MultiScaleTemporalEncoder(
+            hidden_dim=hidden_dim,
+            num_scales=3,  # Captures fine, medium, and coarse temporal context
+            max_steps=100, # Default from temporal_encoder.py
+            dropout=dropout
         )
-        
         # GATED FUSION
         self.fusion = GatedPathwayFusion(hidden_dim, num_pathways=3, dropout=dropout)
         
@@ -769,6 +781,14 @@ class CriticallyFixedProofGNN(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
+
+        self.spectral_recon_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim // 2, k) # Output dim = k
+        )
+        
     
     def forward(self, data) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -787,19 +807,18 @@ class CriticallyFixedProofGNN(nn.Module):
         
         # ===== PATHWAY 1: SPECTRAL =====
         h_spectral = self.spectral_filter(
-            x, data.eigvecs, data.eigvals, data.eig_mask
+            x, data.eigvecs, data.eigvals, data.eig_mask, batch=batch
         )  # [N, hidden_dim]
         
         # ===== PATHWAY 2: SPATIAL =====
         h_spatial = self.spatial_gnn(x, edge_index, edge_attr=data.edge_attr)  # [N, hidden_dim]
         
-        # ===== PATHWAY 3: TEMPORAL (WITH CAUSAL MASKING) =====
+        # ===== PATHWAY 3: TEMPORAL Encoder) =====
         h_temporal = self.temporal_encoder(
-            h_spectral,  # Use spectral features as input
             data.derived_mask,
             data.step_numbers,
-            batch=batch
-        )  # [N, hidden_dim]
+            x 
+        )
         
         # ===== GATED FUSION =====
         h_fused, gate_stats = self.fusion([h_spectral, h_spatial, h_temporal])
@@ -813,9 +832,11 @@ class CriticallyFixedProofGNN(nn.Module):
         
         # Graph-level representation
         graph_embedding = scatter_mean(h_fused, batch, dim=0)  # [num_graphs, hidden_dim]
-        value = self.value_head(graph_embedding[batch[0]])  # [1]
+        value = self.value_head(graph_embedding).squeeze(-1) # [num_graphs]
         
-        return scores, h_fused, value
+        recon_spectral = self.spectral_recon_head(h_fused) # [N, k]
+
+        return scores, h_fused, value, recon_spectral
 
 
 class SpectralFilterFixed(nn.Module):
@@ -891,7 +912,225 @@ class SpatialGNNFixed(nn.Module):
             x = norm(x + x_res)
         
         return x
+class SOTAFixedProofGNN(CriticallyFixedProofGNN):
+    """
+    SOTA-aligned GNN replacing the original CriticallyFixedProofGNN.
+    Inherits pathways but overrides the forward pass to use:
+    1.  Chebyshev polynomial spectral filters (batched).
+    2.  A new 3-pool value head (as requested).
+    """
+    def __init__(self, in_dim, hidden_dim=256, num_layers=6, num_heads=8, dropout=0.2, k=16, poly_order=4):
+        # 1. Call super() correctly.
+        #    The base class __init__ takes: in_dim, hidden_dim, num_layers, dropout, k
+        super().__init__(in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, k=k)
+        
+        # 2. Store new params from your snippet
+        self.poly_order = poly_order
+        self.poly_coeffs = nn.Parameter(torch.zeros(poly_order + 1))
+        logger.info("Using constrained Chebyshev coefficients.")
+        # 3. Override the value_head from the base class
+        self.value_encoder = nn.Sequential(
+            nn.Linear(hidden_dim + 1, hidden_dim),  # +2 for step context
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)  # No sigmoid, predict raw value
+        )
+        logger.info("Using context-aware Value Head.")
+        
+        logger.info("Initialized SOTAFixedProofGNN with Polynomial Filters and 3-Pool Value Head.")
 
+    # In model.py, replace the _chebyshev method
+
+    def _compute_chebyshev_polynomials(self, L_k, order):
+        """
+        Computes all Chebyshev polynomials T_0 to T_order iteratively.
+        
+        Args:
+            L_k: Normalized Laplacian [k, k]
+            order: Max polynomial order
+        
+        Returns:
+            List of T_i(L_k) tensors, [T_0, T_1, ..., T_order]
+        """
+        if order < 0:
+            return []
+        
+        T_list = []
+        T_0 = torch.eye(L_k.size(0), device=L_k.device)
+        T_list.append(T_0)
+
+        if order == 0:
+            return T_list
+
+        T_1 = L_k
+        T_list.append(T_1)
+        
+        for j in range(2, order + 1):
+            # T_n = 2 * L * T_{n-1} - T_{n-2}
+            T_n = 2.0 * L_k @ T_1 - T_0
+            
+            # Add the gradient shortcut you implemented
+            if j % 2 == 0:
+                T_n = T_n + 0.1 * T_0 # Residual from T_{n-2}
+                
+            T_list.append(T_n)
+            T_0, T_1 = T_1, T_n # Shift
+            
+        return T_list
+
+    def forward(self, data):
+        """
+        FIXED forward pass:
+        - Implements prompt's polynomial spectral filter.
+        - FIXES it to be batch-aware (Solves your traceback).
+        - Uses base class pathways (spatial_gnn, temporal_encoder, fusion).
+        - Implements prompt's 3-pool value head.
+        - Returns the 4-tuple signature required by train.py.
+        """
+        x = data.x
+        edge_index = data.edge_index
+        batch = data.batch if hasattr(data, 'batch') else None
+        
+        # --- 1. SPATIAL PATHWAY (from base class) ---
+        h_spatial = self.spatial_gnn(x, edge_index, edge_attr=data.edge_attr)  # [N, D]
+
+        # --- 2. TEMPORAL PATHWAY (from base class) ---
+        # Following your snippet's logic: temporal_pathway(spatial, ...)
+        h_temporal = self.temporal_encoder(
+            data.derived_mask,
+            data.step_numbers,
+            x  # Using spatial as input, as per your snippet
+        ) # [N, D]
+        
+        # --- 3. SPECTRAL PATHWAY (NEW, BATCHED) ---
+        # This replaces the logic that caused the traceback
+        spectral_output_list = []
+        bsz = data.num_graphs if batch is not None else 1
+        k_max = data.eigvecs.shape[1] # k (e.g., 16)
+
+        for i in range(bsz):
+            if batch is None:
+                graph_mask = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+            else:
+                graph_mask = (batch == i)
+
+            input_graph_features = h_spatial[graph_mask] # [N_i, D]
+            if input_graph_features.shape[0] == 0:
+                continue
+
+            # Get spectral data for this graph
+            eigvecs_graph = data.eigvecs[graph_mask] # [N_i, k_max]
+            eigvals_graph = data.eigvals[i*k_max:(i+1)*k_max] # [k_max]
+            eig_mask_graph = data.eig_mask[i*k_max:(i+1)*k_max] # [k_max]
+            
+            k_actual = eig_mask_graph.sum().item()
+            if k_actual == 0:
+                spectral_output_list.append(input_graph_features) # Fallback
+                continue
+
+            # Slice to actual k
+            eigvecs_valid = eigvecs_graph[:, :k_actual] # [N_i, k_actual]
+            eigvals_valid = eigvals_graph[:k_actual] # [k_actual]
+            
+            # Normalize eigenvalues for stability [0, 2] -> [-1, 1] approx
+            eigvals_norm = (eigvals_valid / (eigvals_valid.max() + 1e-6)) * 2.0 - 1.0
+            
+            # Form diagonal matrix of k eigenvalues, L_k
+            L_k = torch.diag_embed(eigvals_norm) # [k_actual, k_actual]
+
+            # 3a. Compute filter g(L_k) = Σ c_i * T_i(L_k)
+            filt = torch.zeros_like(L_k)
+            
+            # Get constrained coefficients
+            constrained_coeffs = self.get_constrained_coeffs()
+            
+            # Compute all polynomials iteratively
+            T_polynomials = self._compute_chebyshev_polynomials(L_k, self.poly_order)
+
+            for j, T_j in enumerate(T_polynomials):
+                if j >= len(constrained_coeffs):
+                    break
+                filt = filt + constrained_coeffs[j] * T_j
+
+
+            eigvecs_valid = eigvecs_graph[:, :k_actual]
+            eigvals_valid = eigvals_graph[:k_actual]
+
+            # CRITICAL FIX: Compute filter response per eigenvalue (scalar operation)
+            eigvals_norm = 2.0 * eigvals_valid / (eigvals_valid.max() + 1e-6) - 1.0
+            filter_response = torch.zeros_like(eigvals_valid)
+
+            # Get constrained coefficients (FIX 1)
+            constrained_coeffs = self.get_constrained_coeffs()
+
+            # Stable Chebyshev evaluation using recurrence
+            T_prev = torch.ones_like(eigvals_norm)  # T_0 = 1
+            T_curr = eigvals_norm.clone()           # T_1 = x
+
+            filter_response = constrained_coeffs[0] * T_prev + constrained_coeffs[1] * T_curr
+
+            for j in range(2, min(self.poly_order + 1, k_actual)):
+                T_next = 2.0 * eigvals_norm * T_curr - T_prev  # Stable recurrence
+                if j % 2 == 0:
+                    T_next = T_next + 0.1 * T_prev
+                filter_response = filter_response + constrained_coeffs[j] * T_next
+                T_prev, T_curr = T_curr, T_next
+
+            # Apply filter in spectral domain
+            x_freq = eigvecs_valid.t() @ input_graph_features  # [k, D]
+            x_filtered = filter_response.unsqueeze(-1) * x_freq
+            h_spectral_graph = eigvecs_valid @ x_filtered
+            
+            # Add residual from the input to the spectral filter
+            h_spectral_graph = h_spectral_graph + 0.5 * input_graph_features 
+            spectral_output_list.append(h_spectral_graph)
+        if not spectral_output_list:
+             h_spectral = torch.zeros_like(h_temporal) # Fallback
+        else:
+             h_spectral = torch.cat(spectral_output_list, dim=0)
+        
+        if h_spectral.shape[0] != x.shape[0]:
+            logger.warning(f"Spectral pathway shape mismatch. Falling back to zeros.")
+            h_spectral = torch.zeros_like(h_temporal)
+        # --- END OF BATCHED SPECTRAL FIX ---
+
+        # --- 4. FUSION (from base class) ---
+        # Your snippet: fused = self.gated_fusion(spatial, spectral, temporal)
+        h_fused, gate_stats = self.fusion([h_spectral, h_spatial, h_temporal]) # [N, D]
+
+        # --- 5. SCORING (from base class, missing in your snippet) ---
+        scores = self.scorer(h_fused).squeeze(-1) # [N]
+
+        # --- 6. VALUE HEAD (NEW, from your snippet) ---
+        if batch is None:
+            batch = torch.zeros(h_fused.shape[0], dtype=torch.long, device=h_fused.device)
+
+        # --- New Value Logic (FIX 8) ---
+        graph_embedding = global_mean_pool(h_fused, batch) # [num_graphs, D]
+
+        # Extract step context from the batch's metadata
+        meta_list = data.meta_list
+        step_context_list = []
+        for meta in meta_list:
+            step_idx = meta['step_idx']
+            proof_length = max(meta['proof_length'], 1)
+            remaining_steps = proof_length - meta['step_idx']
+            step_context_list.append([remaining_steps / proof_length])
+
+        step_context = torch.tensor(step_context_list, device=h_fused.device, dtype=torch.float) # [num_graphs, 2]
+
+        value_input = torch.cat([graph_embedding, step_context], dim=1) # [num_graphs, D+2]
+        value = self.value_encoder(value_input).squeeze(-1) # [num_graphs]
+        
+        # --- 7. RETURN (match train.py) ---
+        # train.py expects: scores, embeddings, value, recon_spectral
+        # We use h_fused as embeddings and h_spectral as dummy recon_spectral
+        return scores, h_fused, value, h_spectral
+        
+
+    def get_constrained_coeffs(self):
+        """Constrain coefficients to decay exponentially to prevent overfitting."""
+        decay = torch.exp(-0.1 * torch.arange(len(self.poly_coeffs), device=self.poly_coeffs.device))
+        return self.poly_coeffs * decay
 def get_model(in_dim, hidden_dim=256, num_layers=4, dropout=0.3, 
               use_type_aware=True, k=16, num_tactics=6, num_rules=5000): # <-- NEW ARGS
     

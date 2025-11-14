@@ -1,0 +1,8 @@
+{
+  "feature_leakage": "CRITICAL",
+  "positional_bias": "WARNING",
+  "degree_bias": "OK",
+  "baseline_ceiling": "WARNING",
+  "temporal_causality": "OK",
+  "loss_gradients": "WARNING"
+}

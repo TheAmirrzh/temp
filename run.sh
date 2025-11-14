@@ -11,7 +11,7 @@
 #    the dataset loaders to use this exact k-value, overriding auto-detection.
 #
 # ==============================================================================
-source "/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv311/bin/activate"
+source "/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv2/bin/activate"
 
 # --- Configuration ---
 
@@ -20,29 +20,31 @@ DATA_DIR="./generated_data"
 SPECTRAL_DIR="./spectral_cache"
 EXP_DIR="./experiment_results"
 VALIDATION_DIR="./validation_reports"
+SEMANTIC_FILE="./atom_embeddings.json"
+
 
 # Path to your virtual environment's Python
-VENV_PYTHON="/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv311/bin/python"
+VENV_PYTHON="/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv2/bin/python"
 
 # Data Generation Config
-N_EASY=400
-N_MEDIUM=400
-N_HARD=300
-N_VERY_HARD=300
+N_EASY=200
+N_MEDIUM=200
+N_HARD=400
+N_VERY_HARD=400
 
 # Spectral Preprocessing Config
 SPECTRAL_K=16 # This is the single source of truth for k
 NUM_WORKERS_SPECTRAL=$(($(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) - 1))
 
 # Training Config
-EPOCHS=30
-BATCH_SIZE=16
+EPOCHS=20
+BATCH_SIZE=32
 HIDDEN_DIM=128
 NUM_LAYERS=3
-LEARNING_RATE=0.0001
+LEARNING_RATE=0.0005
 VALUE_LOSS_WEIGHT=0.1
 TACTIC_LOSS_WEIGHT=0.2
-
+GRAD_ACCUM_STEPS=4
 # --- Script Logic ---
 
 set -e
@@ -82,6 +84,14 @@ mkdir -p "$SPECTRAL_DIR"
 echo "✅ Stale cache cleared. Ready for regeneration."
 echo "-------------------------------------------------"
 
+# echo "🧬 [Step 2.5/7] Preprocessing semantic features..."
+# "$VENV_PYTHON" preprocess_semantic.py \
+#     --data-dir "$DATA_DIR" \
+#     --output-file "$SEMANTIC_FILE"
+# echo "✅ Semantic embeddings saved to $SEMANTIC_FILE."
+# echo "-------------------------------------------------"
+
+
 # 3. Spectral Feature Preprocessing
 echo "📊 [Step 3/6] Preprocessing spectral features (parallelized)..."
 # This will now use the *correct* node count (len(nodes))
@@ -90,16 +100,16 @@ echo "📊 [Step 3/6] Preprocessing spectral features (parallelized)..."
     --data_dir "$DATA_DIR" \
     --output_dir "$SPECTRAL_DIR" \
     --k $SPECTRAL_K \
-    --num_workers $NUM_WORKERS_SPECTRAL
-    # --adaptive-k has been REMOVED
+    --num_workers $NUM_WORKERS_SPECTRAL \
+    --no-adaptive-k
 echo "✅ Spectral features regenerated in $SPECTRAL_DIR with k=$SPECTRAL_K."
 echo "-------------------------------------------------"
 
 # 4. Model Training
 echo "🧠 [Step 4/6] Starting model training..."
-echo "   - Model: TacticGuidedGNN (via get_model)"
-echo "   - Dataset: StepPredictionDataset"
-echo "   - Loss: ProofSearchRankingLoss (Fixed) + Value + Tactic"
+echo "   - Model: SOTAfixedproofGNN "
+echo "   - Dataset: ProofStepDataset"
+echo "   - Learning on original train.py with losses.py"
 "$VENV_PYTHON" train.py \
     --data-dir "$DATA_DIR" \
     --spectral-dir "$SPECTRAL_DIR" \
@@ -109,7 +119,11 @@ echo "   - Loss: ProofSearchRankingLoss (Fixed) + Value + Tactic"
     --hidden-dim $HIDDEN_DIM \
     --lr $LEARNING_RATE \
     --k-dim $SPECTRAL_K \
-    --num-layers $NUM_LAYERS # <-- ADD THIS LINE with your desired value
+    --num-layers $NUM_LAYERS \
+    
+    # --loss-fn sota_info_nce \
+    # --atom-embed-file $SEMANTIC_FILE # <-- ADD THIS LINE with your desired value
+    
 echo "✅ Training complete. Results in $EXP_DIR."
 echo "================================================="
 # 5. Post-Training Validation

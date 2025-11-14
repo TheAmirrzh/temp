@@ -1,508 +1,220 @@
-# IN: diagnose.py (FINAL, SELF-CONTAINED)
-"""
-Comprehensive Diagnostic Script
-================================
-
-FIXED: This script is now SELF-CONTAINED.
-It no longer imports 'fixed_collate_fn' from dataset_utils.
-The correct collate function is defined *inside this file*
-to bypass any caching or import path issues.
-"""
-
 import torch
+import torch.nn.functional as F
 import numpy as np
-import json
-from pathlib import Path
+import logging
+from typing import Dict, List
 from collections import defaultdict
-import argparse
-from tqdm import tqdm
-import random
-from typing import List, Optional
 
-# === CRITICAL: Import all dependencies ===
+# --- Mock Imports ---
+# These are placeholders for your actual file imports
+# In a real run, you would import from dataset.py
 try:
-    from dataset import ProofStepDataset, create_dataloaders
-    from model import CriticallyFixedProofGNN
-    from losses import get_recommended_loss
-    from torch_geometric.loader import DataLoader as GeoDataLoader
-    from torch_geometric.data import Batch, Data
-except ImportError as e:
-    print(f"Failed to import a module: {e}")
-    print("Please ensure dataset.py, model.py, and losses.py are correct.")
-    exit(1)
-
-
-# ==============================================================================
-# SELF-CONTAINED COLLATE FUNCTION
-# (Copied from dataset_utils.py to guarantee it's the one being used)
-# ==============================================================================
-def fixed_collate_fn_LOCAL(batch_list: List[Data]) -> Batch:
-    """
-    Custom collation that preserves graph-level metadata.
-    This is defined locally to avoid any import/cache issues.
-    """
+    from dataset import ProofStepDataset, create_split
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Successfully imported ProofStepDataset.")
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
+    logger.error("Could not import ProofStepDataset. Using mock data.")
     
-    # Filter None samples
-    batch_list = [b for b in batch_list if b is not None]
-    
-    if len(batch_list) == 0:
-        return None
-    
-    # CRITICAL: Must use follow_batch to track node assignments
-    try:
-        # We must follow_batch on every attribute that is per-node
-        follow_attrs = ['x', 'eigvecs', 'derived_mask', 'step_numbers', 'applicable_mask']
-        # Filter to attributes that actually exist in the first data object
-        existing_follow_attrs = [attr for attr in follow_attrs if hasattr(batch_list[0], attr)]
+    # Create mock classes if import fails
+    class MockData:
+        def __init__(self, x, y, applicable_mask):
+            self.x = x
+            self.y = y
+            self.applicable_mask = applicable_mask
+        def __getitem__(self, key):
+             # Mock for x[target_idx]
+            if key == 'y': return self.y
+            if key == 'applicable_mask': return self.applicable_mask
+            return self.x
+            
+    class ProofStepDataset:
+        def __init__(self, *args, **kwargs):
+            self.mock_db = self._generate_mock_data()
         
-        batch = Batch.from_data_list(batch_list, follow_batch=existing_follow_attrs)
-    except Exception as e:
-        print(f"ERROR during Batch.from_data_list: {e}")
-        print("This might be a PyG version issue or a data misalignment.")
-        return None
+        def _generate_mock_data(self):
+            db = []
+            # 1. Easy case: features are very different
+            db.append(MockData(
+                x=torch.tensor([
+                    [1.0, 0.0, 0.0], # Target
+                    [0.0, 1.0, 0.0], # App
+                    [0.0, 0.0, 1.0], # Inapp
+                ]),
+                y=torch.tensor([0]),
+                applicable_mask=torch.tensor([True, True, False])
+            ))
+            # 2. Hard case: applicable features are similar
+            db.append(MockData(
+                x=torch.tensor([
+                    [0.9, 0.1, 0.5], # Target
+                    [0.8, 0.2, 0.6], # App (similar)
+                    [0.0, 0.0, 1.0], # Inapp
+                ]),
+                y=torch.tensor([0]),
+                applicable_mask=torch.tensor([True, True, False])
+            ))
+            return db
 
-    # === THIS IS THE FIX WE ARE TESTING ===
-    # Add critical metadata for index mapping
-    try:
-        batch.num_nodes_per_graph = torch.tensor(
-            [data.x.shape[0] for data in batch_list],
-            dtype=torch.long
-        )
+        def __len__(self):
+            return len(self.mock_db)
+
+        def __getitem__(self, idx):
+            return self.mock_db[idx]
+
+    def create_split(*args, **kwargs):
+        return [], [], [] # Return empty lists
+# --- End Mock Imports ---
+
+
+class FeatureDiagnostic:
+    """
+    Tests the quality of node features in a ProofStepDataset.
+    
+    The key question: Are the features good enough to distinguish
+    the *correct* applicable rule from *other* applicable rules?
+    """
+
+    def __init__(self, dataset: ProofStepDataset):
+        self.dataset = dataset
+        if not hasattr(self, 'dataset') or len(self.dataset) == 0:
+             logger.warning("Dataset is empty or failed to load. Using mock data.")
+             self.dataset = ProofStepDataset() # Fallback to mock
+
+        self.results = defaultdict(list)
+
+    def run_diagnostics(self, num_samples=100):
+        logger.info(f"Running feature diagnostics on {min(num_samples, len(self.dataset))} samples...")
         
-        # Cumulative node offsets for index translation
-        batch.node_offsets = torch.cat([
-            torch.tensor([0]),
-            torch.cumsum(batch.num_nodes_per_graph[:-1], dim=0)
-        ])
-    except Exception as e:
-        print(f"ERROR while adding metadata in collate fn: {e}")
-        return None
-    # === END FIX ===
-    
-    # Store spectral features as lists (variable k per graph)
-    if hasattr(batch_list[0], 'eigvecs'):
-        batch.eigvecs_list = [data.eigvecs for data in batch_list]
-        batch.eigvals_list = [data.eigvals for data in batch_list]
-        batch.eig_mask_list = [data.eig_mask for data in batch_list]
-    
-    # Per-graph applicable masks (CRITICAL for correct loss)
-    # This might be redundant if we follow_batch 'applicable_mask'
-    if hasattr(batch_list[0], 'applicable_mask') and not hasattr(batch, 'applicable_mask_list'):
-         batch.applicable_mask_list = [data.applicable_mask for data in batch_list]
-    
-    # Store metadata
-    if hasattr(batch_list[0], 'meta'):
-        batch.meta_list = [data.meta for data in batch_list]
-    
-    return batch
-# ==============================================================================
-# END OF SELF-CONTAINED COLLATE FUNCTION
-# ==============================================================================
+        for i in range(min(num_samples, len(self.dataset))):
+            try:
+                data = self.dataset[i]
+                if data is None:
+                    continue
 
+                target_idx = data.y.item()
+                applicable_mask = data.applicable_mask
+                x = data.x
 
-def diagnose_dataset(data_dir: str, spectral_dir: str = None, max_samples: int = 100):
-    """Comprehensive dataset diagnostics"""
-    
-    print("\n" + "="*80)
-    print("📊 DATASET DIAGNOSTICS")
-    print("="*80)
-    
-    json_files = list(Path(data_dir).glob("**/*.json"))
-    
-    if len(json_files) == 0:
-        print("❌ No JSON files found!")
-        return False
+                if not applicable_mask[target_idx]:
+                    # This is a data-loading error, skip
+                    continue
+                
+                applicable_indices = applicable_mask.nonzero(as_tuple=True)[0]
+                
+                # 1. Calculate the 'applicable_random' baseline
+                num_applicable = len(applicable_indices)
+                if num_applicable > 0:
+                    self.results['baseline_applicable_random'].append(1.0 / num_applicable)
 
-    if len(json_files) > max_samples:
-        json_files = random.sample(json_files, max_samples)
-    
-    print(f"\n✅ Found {len(json_files)} files to analyze...")
-    
-    stats = defaultdict(int)
-    stats['node_counts'] = []
-    stats['edge_counts'] = []
-    stats['proof_lengths'] = []
-    issues = []
-    
-    for json_file in tqdm(json_files, desc="Analyzing files"):
-        try:
-            with open(json_file) as f:
-                inst = json.load(f)
-            
-            nodes = inst.get('nodes', [])
-            edges = inst.get('edges', [])
-            proof_steps = inst.get('proof_steps', [])
-            
-            stats['node_counts'].append(len(nodes))
-            stats['edge_counts'].append(len(edges))
-            stats['proof_lengths'].append(len(proof_steps))
-            
-            if len(proof_steps) == 0:
-                stats['empty_proofs'] += 1
-                issues.append(f"{json_file.name}: Empty proof")
+                # 2. Test feature uniqueness
+                if num_applicable > 1:
+                    self._test_feature_similarity(x, target_idx, applicable_indices)
+
+            except Exception as e:
+                logger.error(f"Failed on sample {i}: {e}")
                 continue
-            
-            nid_to_idx = {n['nid']: i for i, n in enumerate(nodes)}
-            
-            # --- START FIX: Correctly simulate proof state ---
-            known_atoms = set()
-            for node in nodes:
-                if node.get('is_initial', False) and node.get('type') == 'fact':
-                    if node.get('atom'):
-                        known_atoms.add(node.get('atom'))
-            
-            for step_idx, step in enumerate(proof_steps):
-                rule_nid = step.get('used_rule')
-                derived_nid = step.get('derived_node')
-                
-                if rule_nid not in nid_to_idx:
-                    stats['invalid_targets'] += 1
-                    issues.append(f"{json_file.name} step {step_idx}: rule {rule_nid} not in nodes")
-                    continue
-                
-                if derived_nid not in nid_to_idx:
-                    stats['invalid_targets'] += 1
-                    issues.append(f"{json_file.name} step {step_idx}: derived_node {derived_nid} not in nodes")
-                    continue
-                
-                rule_node = nodes[nid_to_idx[rule_nid]]
-                derived_node = nodes[nid_to_idx[derived_nid]]
-                
-                body_atoms = set(rule_node.get('body_atoms', []))
-                head_atom = rule_node.get('head_atom')
-                derived_atom = derived_node.get('atom')
-
-                if head_atom != derived_atom:
-                     stats['head_mismatch'] += 1
-                     issues.append(f"{json_file.name} step {step_idx}: Rule head '{head_atom}' != derived '{derived_atom}'")
-                
-                # Check applicability *before* adding the new fact
-                is_applicable = body_atoms.issubset(known_atoms)
-                head_already_known = head_atom in known_atoms
-                
-                if not is_applicable or head_already_known:
-                    stats['inapplicable_targets'] += 1
-                    missing = body_atoms - known_atoms
-                    issues.append(
-                        f"{json_file.name} step {step_idx} (rule {rule_nid}): "
-                        f"NOT APPLICABLE. Missing: {missing}, HeadKnown: {head_already_known}"
-                    )
-                
-                # Add the new fact for the *next* step's check
-                if derived_atom:
-                    known_atoms.add(derived_atom)
-            # --- END FIX ---
         
-        except Exception as e:
-            stats['load_errors'] += 1
-            issues.append(f"{json_file.name}: Failed to load ({e})")
-    
-    # Print statistics
-    print(f"\n📈 Statistics:")
-    print(f"   Files analyzed: {len(json_files)}")
-    print(f"   Empty proofs: {stats['empty_proofs']}")
-    print(f"   Invalid targets: {stats['invalid_targets']}")
-    print(f"   Head mismatches: {stats['head_mismatch']}")
-    print(f"   Inapplicable targets: {stats['inapplicable_targets']}")
-    
-    if stats['node_counts']:
-        print(f"\n   Node count: {np.mean(stats['node_counts']):.1f} ± {np.std(stats['node_counts']):.1f}")
-        print(f"   Edge count: {np.mean(stats['edge_counts']):.1f} ± {np.std(stats['edge_counts']):.1f}")
-        print(f"   Proof length: {np.mean(stats['proof_lengths']):.1f} ± {np.std(stats['proof_lengths']):.1f}")
-    
-    # Print issues
-    if stats['inapplicable_targets'] > 0 or stats['invalid_targets'] > 0 or stats['head_mismatch'] > 0:
-        print(f"\n⚠️  Found {len(issues)} critical issues:")
-        for issue in issues[:10]:  # Show first 10
-            print(f"   - {issue}")
-        if len(issues) > 10:
-            print(f"   ... and {len(issues) - 10} more")
-        return False
-    else:
-        print("\n✅ No data quality issues found!")
-        return True
+        self.print_report()
+
+    def _test_feature_similarity(self, x: torch.Tensor, target_idx: int, applicable_indices: torch.Tensor):
+        """
+        Checks if the target's features are distinct from other *applicable* rules.
+        """
+        target_features = x[target_idx].unsqueeze(0) # [1, D]
+        
+        # Get other applicable indices
+        other_applicable_mask = (applicable_indices != target_idx)
+        other_indices = applicable_indices[other_applicable_mask]
+
+        if len(other_indices) == 0:
+            # Target was the only applicable rule
+            self.results['target_was_unique'].append(1.0)
+            return
+
+        other_features = x[other_indices] # [K, D]
+        
+        # Cosine similarity between target and all other applicable rules
+        similarities = F.cosine_similarity(target_features, other_features) # [K]
+        
+        # Find the most similar competitor
+        max_similarity = similarities.max().item()
+        self.results['max_similarity_to_competitor'].append(max_similarity)
+        
+        # Did a competitor have *identical* features?
+        if max_similarity > 0.999:
+            self.results['feature_collisions'].append(1.0)
 
 
-def diagnose_batching(data_dir: str, spectral_dir: str = None):
-    """
-    Test batching pipeline.
-    FIXED: Uses the self-contained 'fixed_collate_fn_LOCAL'
-    defined inside this script.
-    """
-    
-    print("\n" + "="*80)
-    print("📦 BATCHING DIAGNOSTICS")
-    print("="*80)
-    
+    def print_report(self):
+        logger.info("\n" + "="*80)
+        logger.info("🔬 FEATURE DIAGNOSTIC REPORT")
+        logger.info("="*80)
+
+        if not self.results:
+            logger.error("No valid samples were processed. Cannot generate report.")
+            return
+
+        # --- Baseline Report ---
+        baseline_acc = np.mean(self.results['baseline_applicable_random']) * 100
+        logger.info(f"📊 Baseline 'Applicable Random' Accuracy: {baseline_acc:.2f}%")
+        logger.info(f"   (This is the score to beat. It means on average there are ~{1/ (baseline_acc / 100):.2f} applicable rules to choose from.)")
+
+        # --- Feature Quality Report ---
+        if 'max_similarity_to_competitor' in self.results:
+            avg_max_sim = np.mean(self.results['max_similarity_to_competitor'])
+            collisions = np.sum(self.results.get('feature_collisions', [0]))
+            total_comparisons = len(self.results['max_similarity_to_competitor'])
+
+            logger.info(f"\n📊 Feature Expressiveness (Cosine Similarity):")
+            logger.info(f"   Avg. Max Similarity to Competitor: {avg_max_sim:.4f}")
+            logger.info(f"   Feature Collisions (Similarity > 0.999): {collisions} / {total_comparisons} ({collisions/total_comparisons:.1%})")
+
+            logger.info("\n--- ANALYSIS ---")
+            if avg_max_sim > 0.9:
+                logger.warning("🔥 WARNING: Features are NOT expressive.")
+                logger.warning("  The target rule's features are, on average, >90% similar to its closest competitor.")
+            elif avg_max_sim > 0.7:
+                 logger.warning("  CAUTION: Features are only moderately expressive.")
+            else:
+                 logger.info("  ✅ INFO: Features appear to be highly expressive (avg. similarity < 0.7).")
+
+            if collisions / total_comparisons > 0.05:
+                 logger.error("  ❌ CRITICAL: More than 5% of samples have feature collisions.")
+                 logger.error("     This proves your features are not SOTA and cannot distinguish the target.")
+            
+            logger.info("\nRECOMMENDATION: See 'sota_dataset_design.md' to engineer new features.")
+        
+        logger.info("="*80)
+
+def main():
+    # --- This will use your REAL dataset ---
     try:
-        # --- START: Manual Dataloader Construction ---
-        print("   Creating data splits...")
-        from dataset import create_split
-        train_files, _, _ = create_split(data_dir, train_ratio=0.7, val_ratio=0.15, seed=42)
+        from dataset import create_split, ProofStepDataset
         
-        print("   Creating ProofStepDataset...")
-        from dataset import ProofStepDataset
-        train_dataset = ProofStepDataset(
-            train_files, 
-            spectral_dir=spectral_dir, 
+        # 1. Load your data files
+        train_files, _, _ = create_split(
+            data_dir='generated_data', 
+            train_ratio=0.7, 
+            val_ratio=0.15, 
             seed=42
         )
         
-        print(f"   Using *LOCAL* fixed_collate_fn_LOCAL (self-contained)...")
-        
-        print("   Creating GeoDataLoader...")
-        train_loader = GeoDataLoader(
-            train_dataset, 
-            batch_size=8, 
-            shuffle=True, 
-            num_workers=0,
-            collate_fn=fixed_collate_fn_LOCAL  # <-- FORCING a successful batch
+        # 2. Initialize your real dataset
+        dataset = ProofStepDataset(
+            json_files=train_files,
+            spectral_dir='spectral_cache', # Not actually used, but good to pass
+            seed=42
         )
-        # --- END: Manual Dataloader Construction ---
-
-        print(f"\n✅ Data loader created explicitly with *local* collate fn.")
-        print(f"   Train batches: {len(train_loader)}")
-        
-        # Test a batch
-        print(f"\n🔍 Testing first batch...")
-        
-        batch = None
-        for i, b in enumerate(train_loader):
-            if b is not None:
-                batch = b
-                print(f"   Loaded first valid batch (index {i}).")
-                break
-            if i > 50: # Fail-safe
-                print("   Checked 50 batches, all returned None. __getitem__ is failing.")
-                return False
-
-        if batch is None:
-            print(f"   ❌ Batch is None! This means __getitem__ is failing for all items.")
-            print(f"   Check your file paths. Is '--spectral-dir {spectral_dir}' correct?")
-            return False
-        
-        print(f"   Batch size: {batch.num_graphs if hasattr(batch, 'num_graphs') else 1}")
-        print(f"   Total nodes: {batch.x.shape[0]}")
-        print(f"   Total edges: {batch.edge_index.shape[1]}")
-        
-        # Check for batching metadata
-        if hasattr(batch, 'num_nodes_per_graph'):
-            print(f"   ✅ Has num_nodes_per_graph: {batch.num_nodes_per_graph.tolist()}")
-        else:
-            print(f"   ❌ Missing num_nodes_per_graph!")
-            return False
-        
-        if hasattr(batch, 'node_offsets'):
-            print(f"   ✅ Has node_offsets: {batch.node_offsets.tolist()}")
-        else:
-            print(f"   ❌ Missing node_offsets!")
-            return False
-        
-        if hasattr(batch, 'y'):
-            print(f"\n🎯 Target validation:")
-            for i in range(batch.num_graphs):
-                target = batch.y[i].item()
-                start = batch.node_offsets[i].item()
-                end = start + batch.num_nodes_per_graph[i].item()
-                
-                in_range = start <= target < end
-                print(f"   Graph {i}: target={target}, range=[{start}, {end}), valid={in_range}")
-                
-                if not in_range:
-                    print(f"   ❌ Target out of range!")
-                    return False
-        
-        # Check applicable mask (if it was followed correctly)
-        if hasattr(batch, 'applicable_mask'):
-            print(f"\n✅ Has applicable_mask (batched tensor)")
-            
-            for i in range(batch.num_graphs):
-                if i >= len(batch.y): break
-                
-                # Get local mask and local target
-                start = batch.node_offsets[i].item()
-                end = start + batch.num_nodes_per_graph[i].item()
-                graph_mask = batch.applicable_mask[start:end]
-                
-                target_global = batch.y[i].item()
-                target_local = target_global - start
-
-                if target_local < 0 or target_local >= len(graph_mask):
-                    print(f"   ❌ Graph {i}: Local target {target_local} out of range for mask (len {len(graph_mask)})")
-                    return False
-                
-                is_applicable = graph_mask[target_local].item()
-                if not is_applicable:
-                    print(f"   ❌ Graph {i}: target {target_global} (local {target_local}) not applicable!")
-                    return False
-            print("   ✅ All targets are applicable.")
-        else:
-            print(f"\n⚠️  No applicable_mask found (batched). This might be ok.")
-        
-        print("\n✅ Batching pipeline looks good!")
-        return True
-    
     except Exception as e:
-        print(f"\n❌ Batching failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        logger.critical(f"Failed to load real dataset: {e}. Falling back to mock data.")
+        dataset = ProofStepDataset(json_files=[]) # Init mock data
 
+    # 3. Run diagnostics
+    diagnostic = FeatureDiagnostic(dataset)
+    diagnostic.run_diagnostics(num_samples=500)
 
-def diagnose_model(hidden_dim=256, k_dim=16):
-    """Test model forward pass"""
-    
-    print("\n" + "="*80)
-    print("🧠 MODEL DIAGNOSTICS")
-    print("="*80)
-    
-    try:
-        print("   Initializing CriticallyFixedProofGNN (as used in train.py)...")
-        model = CriticallyFixedProofGNN(
-            in_dim=22,
-            hidden_dim=hidden_dim,
-            num_layers=3,
-            dropout=0.3,
-            k=k_dim
-        )
-        
-        num_params = sum(p.numel() for p in model.parameters())
-        print(f"\n✅ Model created: {num_params:,} parameters")
-        
-        # Create dummy batch
-        num_nodes = 30
-        num_edges = 60
-        
-        batch = type('Batch', (), {
-            'x': torch.randn(num_nodes, 22),
-            'edge_index': torch.randint(0, num_nodes, (2, num_edges)),
-            'edge_attr': torch.randint(0, 3, (num_edges,)),
-            'derived_mask': torch.randint(0, 2, (num_nodes,), dtype=torch.uint8),
-            'step_numbers': torch.randint(0, 10, (num_nodes,)),
-            'eigvecs': torch.randn(num_nodes, k_dim),
-            'eigvals': torch.randn(k_dim),
-            'eig_mask': torch.ones(k_dim, dtype=torch.bool),
-            'batch': torch.zeros(num_nodes, dtype=torch.long),
-            'num_graphs': 1,
-            'y': torch.tensor([5]),
-            'value_target': torch.tensor([0.5]),
-            'applicable_mask': torch.ones(num_nodes, dtype=torch.bool),
-            'node_offsets': torch.tensor([0]),
-            'num_nodes_per_graph': torch.tensor([num_nodes])
-        })()
-        
-        print(f"\n🔍 Testing forward pass...")
-        scores, embeddings, value = model(batch)
-        
-        print(f"   ✅ Scores shape: {scores.shape}")
-        print(f"   ✅ Embeddings shape: {embeddings.shape}")
-        print(f"   ✅ Value shape: {value.shape}")
-        
-        assert scores.shape == (num_nodes,)
-        assert embeddings.shape == (num_nodes, hidden_dim)
-        assert value.shape == (1,)
-        
-        if torch.isnan(scores).any():
-            print(f"   ❌ NaN in scores!")
-            return False
-        
-        if torch.isinf(scores).any():
-            print(f"   ❌ Inf in scores!")
-            return False
-        
-        print(f"\n✅ Model forward pass successful!")
-        return True
-    
-    except Exception as e:
-        print(f"\n❌ Model test failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def diagnose_loss():
-    """Test loss computation"""
-    
-    print("\n" + "="*80)
-    print("💔 LOSS DIAGNOSTICS")
-    print("="*80)
-    
-    loss_types = ['cross_entropy', 'triplet_hard', 'applicability_constrained']
-    
-    for loss_type in loss_types:
-        print(f"\n🔍 Testing {loss_type}...")
-        
-        try:
-            criterion = get_recommended_loss(loss_type, margin=1.0)
-            
-            num_nodes = 20
-            scores = torch.randn(num_nodes, requires_grad=True)
-            embeddings = torch.randn(num_nodes, 256)
-            target_idx = 5
-            applicable_mask = torch.ones(num_nodes, dtype=torch.bool)
-            applicable_mask[target_idx] = True
-            
-            loss = criterion(scores, embeddings, target_idx, applicable_mask)
-            
-            print(f"   Loss value: {loss.item():.4f}")
-            
-            if torch.isnan(loss):
-                print(f"   ❌ NaN loss!")
-                return False
-            
-            if torch.isinf(loss):
-                print(f"   ❌ Inf loss!")
-                return False
-            
-            loss.backward()
-            print(f"   ✅ Backward pass successful")
-        
-        except Exception as e:
-            print(f"   ❌ Failed: {e}")
-            return False
-    
-    print(f"\n✅ All loss functions working!")
-    return True
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Diagnose your pipeline")
-    parser.add_argument('--data-dir', required=True)
-    parser.add_argument('--spectral-dir', default=None)
-    parser.add_argument('--max-samples', type=int, default=100)
-    
-    args = parser.parse_args()
-    
-    print("\n" + "="*80)
-    print("🔬 COMPREHENSIVE PIPELINE DIAGNOSTICS")
-    print("="*80)
-    
-    results = {
-        'dataset': diagnose_dataset(args.data_dir, args.spectral_dir, args.max_samples),
-        'batching': diagnose_batching(args.data_dir, args.spectral_dir),
-        'model': diagnose_model(),
-        'loss': diagnose_loss()
-    }
-    
-    print("\n" + "="*80)
-    print("📋 SUMMARY")
-    print("="*80)
-    
-    for component, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"   {component.upper()}: {status}")
-    
-    all_passed = all(results.values())
-    
-    if all_passed:
-        print(f"\n🎉 All diagnostics passed! Ready to train.")
-    else:
-        print(f"\n⚠️  Some diagnostics failed. Fix issues before training.")
-    
-    return all_passed
-
-
-if __name__ == '__main__':
-    import sys
-    success = main()
-    sys.exit(0 if success else 1)
+if __name__ == "__main__":
+    main()
